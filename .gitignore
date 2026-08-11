@@ -1,5 +1,6 @@
 # arduino-cli 빌드 산출물
 build/
+build.log
 
 # JetBrains IDE
 .idea/
