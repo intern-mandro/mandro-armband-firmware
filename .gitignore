@@ -1,0 +1,5 @@
+# arduino-cli 빌드 산출물
+build/
+
+# JetBrains IDE
+.idea/
