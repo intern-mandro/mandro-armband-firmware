@@ -27,12 +27,16 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include <LittleFS.h>
+#include <Preferences.h>    // 로봇 의수 MAC 주소를 ESP32의 NVS에 저장 
 
 #include "preprocessor.h"
 #include "nn.h"
 
 #define WEIGHTS_PATH     "/weights.bin"
 #define WEIGHTS_TMP_PATH "/weights.tmp"
+
+#define PAIR_HDR         0xE0
+#define PAIR_PACKET_LEN  8       // 헤더 1B + MAC 6B + 체크섬 1B = 8B
 
 // =========================
 // 설정 (UNCHANGED FROM RECORDER)
@@ -50,6 +54,7 @@ static const char* SERVICE_UUID              = "12345678-1234-1234-1234-12345678
 static const char* CHARACTERISTIC_UUID       = "abcd1234-5678-1234-5678-abcdef123456";  // raw samples
 static const char* CHARACTERISTIC_UUID_PRED  = "abcd1234-5678-1234-5678-abcdef123457";  // predictions
 static const char* CHARACTERISTIC_UUID_WEIGHTS = "abcd1234-5678-1234-5678-abcdef123458"; // 가중치 수신 (신규)
+static const char* CHARACTERISTIC_UUID_PAIR = "abcd1234-5678-1234-5678-abcdef123459";   // 페어링용 
 
 
 // =========================
@@ -123,7 +128,57 @@ const char* weightSaveResultStr(WeightSaveResult r) {
 BLECharacteristic* pCharacteristic;         // raw samples
 BLECharacteristic* pCharacteristicPred;     // predictions
 BLECharacteristic* pCharacteristicWeights;  // 가중치 수신 (신규)
+BLECharacteristic* pCharacteristicPair;     // 페어링용 MAC 수신 
+
 bool deviceConnected = false;
+
+// ── Pairing: 로봇 의수 MAC 저장 ──────────────────
+Preferences pairPrefs;
+uint8_t masterMac[6] = {0};
+bool hasMasterMac = false;
+
+// ESP32에 저장된 로봇 의수 MAC을 불러오고, 저장 여부를 확인하는 함수 
+void loadMasterMac() {
+  pairPrefs.begin("pairing", true);
+
+  size_t n = pairPrefs.getBytes(
+    "master_mac", 
+    masterMac, 
+    sizeof(masterMac)
+  );
+
+  pairPrefs.end();
+
+  hasMasterMac = (n == sizeof(masterMac));
+
+  if (hasMasterMac) {
+    Serial.printf(
+      "# PAIR: 저장된 마스터 %02X:%02X:%02X:%02X:%02X:%02X\n", 
+      masterMac[0], 
+      masterMac[1], 
+      masterMac[2], 
+      masterMac[3], 
+      masterMac[4], 
+      masterMac[5]
+    );
+  } else {
+    Serial.println("# PAIR: 저장된 마스터 없음");
+  }
+}
+
+// PC에게 Pairing 결과를 보내는 함수
+void notifyPairResult(const char* msg) {
+  if (!deviceConnected) {
+    return;
+  }
+
+  pCharacteristicPair->setValue(
+    (uint8_t*)msg, 
+    strlen(msg)
+  );
+
+  pCharacteristicPair->notify();
+}
 
 // ── BLE 가중치 수신 상태 ──────────────────────────────────────────────
 // Android(BleManager.kt::sendWeights())가 244바이트씩 순차 Write Request로
@@ -144,6 +199,7 @@ void notifyWeightsResult(const char* msg) {
 void resetBleWeightReceive() {
   bleWeightBufLen = 0;
 }
+
 
 // BLE ATT의 "write 확인 응답"은 onWrite() 콜백이 return해야 스택이 실제로
 // 내보낼 수 있음 — 콜백 안에서 delay()+ESP.restart()로 블로킹해버리면 안드로이드가
@@ -212,6 +268,83 @@ class WeightsCharCallbacks : public BLECharacteristicCallbacks {
       pendingRestart = true;
       restartAtMs = millis() + 300;  // NOTIFY가 실제로 나갈 시간만 살짝 확보
     }
+  }
+};
+
+class PairCharCallbacks : public BLECharacteristicCallbacks  {
+
+  void onRead(BLECharacteristic* c) override {
+    if (hasMasterMac) {
+      c->setValue(masterMac, 6);
+    } else {
+      uint8_t empty = 0;
+      c->setValue(&empty, 0);
+    }
+  }
+
+  void onWrite(BLECharacteristic* c) override {
+
+    const uint8_t* d = c->getData();
+    size_t len = c->getLength();
+
+    // 1. 길이 + 헤더 검사
+    if (len != PAIR_PACKET_LEN || d[0] != PAIR_HDR) {
+
+      Serial.printf(
+        "# PAIR: 형식 불일치 (len=%u, hdr=%02X)\n", 
+        (unsigned)len, 
+        len ? d[0] : 0
+      );
+
+      notifyPairResult("ERR:PAIR_FORMAT");
+
+      return;
+    }
+
+    // 2. XOR checksum 검사
+    uint8_t chk = 0;
+
+    for (int i = 1; i < PAIR_PACKET_LEN - 1; ++i) {
+      chk ^= d[i];
+    }
+
+    if (chk != d[PAIR_PACKET_LEN - 1]) {
+
+      Serial.println("# PAIR: 체크섬 불일치");
+
+      notifyPairResult("ERR:PAIR_CRC");
+      
+      return;
+    }
+
+    // 3. MAC 6byte 복사
+    memcpy(masterMac, d + 1, 6);
+
+    // 4. NVS에 저장
+    pairPrefs.begin("pairing", false);  // pairing 저장공간 열기 
+
+    pairPrefs.putBytes(
+      "master_mac", 
+      masterMac, 
+      6
+    );
+
+    pairPrefs.end();
+
+    hasMasterMac = true;   // 현재 유효한 마스터주소 있다고 상태 변경 
+
+    // PC에 성공 응답
+    notifyPairResult("OK:PAIR");
+
+    Serial.printf(
+      "# PAIR: 저장 완료 %02X:%02X:%02X:%02X:%02X:%02X\n", 
+      masterMac[0],
+      masterMac[1],
+      masterMac[2],
+      masterMac[3],
+      masterMac[4],
+      masterMac[5] 
+    );
   }
 };
 
@@ -377,6 +510,20 @@ void setup() {
   );
   pCharacteristicWeights->addDescriptor(new BLE2902());
   pCharacteristicWeights->setCallbacks(new WeightsCharCallbacks());
+
+  // 페어링용 Characteristic 만들기 
+  pCharacteristicPair = pService->createCharacteristic(
+    CHARACTERISTIC_UUID_PAIR, 
+    BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ
+  );
+  pCharacteristicPair->addDescriptor(new BLE2902());
+  pCharacteristicPair->setCallbacks(new PairCharCallbacks());
+
+  loadMasterMac();
+
+  if (hasMasterMac) {
+    pCharacteristicPair->setValue(masterMac, 6);
+  }
 
   pService->start();
 
