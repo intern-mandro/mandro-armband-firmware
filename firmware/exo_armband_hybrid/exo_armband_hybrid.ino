@@ -51,12 +51,63 @@
 #define WEIGHT_MAGIC        0xDEADBEEFUL
 #define WEIGHTS_TOTAL_BYTES 53304UL  // W0 b0 W1 b1 W2 b2 means stds (float32)
 
+
 static const char* SERVICE_UUID              = "12345678-1234-1234-1234-1234567890ab";
 static const char* CHARACTERISTIC_UUID       = "abcd1234-5678-1234-5678-abcdef123456";  // raw samples
 static const char* CHARACTERISTIC_UUID_PRED  = "abcd1234-5678-1234-5678-abcdef123457";  // predictions
-static const char* CHARACTERISTIC_UUID_WEIGHTS = "abcd1234-5678-1234-5678-abcdef123458"; // 가중치 수신 (신규)
+static const char* CHARACTERISTIC_UUID_WEIGHTS = "abcd1234-5678-1234-5678-abcdef123458"; // 가중치 수신
 static const char* CHARACTERISTIC_UUID_PAIR = "abcd1234-5678-1234-5678-abcdef123459";   // 페어링용 
 
+// MARK7(로봇 의수) BLE 모듈. MAC: 3C:A5:51:99:BB:5F
+//
+// 실물 GATT 구조 — reference/BLE_Scanner.png (기기명 CHIPSEN, NOT BONDED):
+
+//   0000FFF0  service (Primary)
+//     ├ 0000FFF1  NOTIFY (+ CCCD 0x2902)     ← 의수 → 암밴드 (STATUS/ACK)
+//     └ 0000FFF2  WRITE, WRITE NO RESPONSE   ← 암밴드 → 의수 (CMD)
+
+static const char* MARK7_SERVICE_UUID = "0000fff0-0000-1000-8000-00805f9b34fb";
+static const char* MARK7_CMD_UUID     = "0000fff2-0000-1000-8000-00805f9b34fb";  // write
+static const char* MARK7_STATUS_UUID  = "0000fff1-0000-1000-8000-00805f9b34fb";  // notify
+
+// ── 벤치 테스트용 MAC 강제 지정 ─────────────────────────────────────────
+
+#define MARK7_MAC_OVERRIDE 1
+static const uint8_t MARK7_MAC_FORCED[6] = { 0x5C, 0xF2, 0x86, 0x49, 0x3A, 0xAA };
+
+// ── 의수 명령 프로토콜 (hand.py:1-8, build_cmd() 기준) ──────────────────
+// CMD 12byte: HDR(0xFF) + finger_sel + speed + current + pos[6] + dir + XOR
+//   XOR 범위는 byte 1~10 (헤더 제외), 결과를 byte 11에 넣는다.
+//   payload 12B는 MTU 안에 들어가므로 한 번의 write로 전송된다.
+//
+// finger_sel 비트마스크: bit5=F1(엄지) bit4=F2 bit3=F3 bit2=F4 bit1=F5 bit0=F6(엄지외전)
+//   0x1E = F2~F5,  0x3F = 전체
+// dir: 1=GRASP, 2=RELEASE, 4=RESET_POWER
+//
+// ※ 현재 runInference()는 1바이트만 보내고 있어서 의수가 절대 해석하지 못한다.
+//   12byte 패킷 생성기로 교체해야 한다 (아래 TODO).
+#define MARK7_HDR_CMD      0xFF
+#define MARK7_CMD_LEN      12
+#define MARK7_DIR_GRASP    1
+#define MARK7_DIR_RELEASE  2
+#define MARK7_DIR_RESET    4
+#define MARK7_STATUS_LEN   36   // 의수 → 암밴드 STATUS (hand.py::STATUS_BUF_SIZE)
+
+// ── 벤치 테스트용 스윕 ──────────────────────────────────────────────────
+// 1로 두면 추론 결과와 무관하게 rest/close CMD를 주기적으로 번갈아 보낸다.
+// 용도: CHIPSEN 모듈을 PC USB에 물려놓고 시리얼 툴로 12바이트가 실제로 나오는지
+// 확인할 때. runInference()는 /weights.bin이 있어야만 돌기 때문에(loop()의
+// nn.isLoaded() 조건), 가중치를 안 올린 상태에서는 제스처 경로로 아무것도 안
+// 나간다 — 그때 이걸 켜면 BLE 경로만 따로 검증된다.
+#define MARK7_TEST_SWEEP     0
+#define MARK7_TEST_SWEEP_MS  1500
+
+// 모드 전환 타이밍
+#define SCAN_SECONDS           2      // 스캔 1회 지속 (loop 블로킹)
+#define MASTER_ENTRY_DELAY_MS  1000   // MASTER 진입 후 첫 스캔까지 유예
+#define HAND_RETRY_MS_MIN      1000
+#define HAND_RETRY_MS_MAX      30000
+#define HAND_KEEPALIVE_MS      500
 
 // =========================
 // NEW: 가중치 수신 — 공통 로직 (USB/BLE 공용)
@@ -123,15 +174,15 @@ const char* weightSaveResultStr(WeightSaveResult r) {
 
 
 // =========================
-// BLE
+// BLE - 슬레이브(Server) 측
 // =========================
 
 BLECharacteristic* pCharacteristic;         // raw samples
 BLECharacteristic* pCharacteristicPred;     // predictions
-BLECharacteristic* pCharacteristicWeights;  // 가중치 수신 (신규)
+BLECharacteristic* pCharacteristicWeights;  // 가중치 수신
 BLECharacteristic* pCharacteristicPair;     // 페어링용 MAC 수신 
 
-bool deviceConnected = false;
+volatile bool deviceConnected = false;
 
 // ── Pairing: 로봇 의수 MAC 저장 ──────────────────
 Preferences pairPrefs;
@@ -165,6 +216,19 @@ void loadMasterMac() {
   } else {
     Serial.println("# PAIR: 저장된 마스터 없음");
   }
+
+#if MARK7_MAC_OVERRIDE
+  // NVS 값을 덮어쓴다. 이 한 곳만 바꾸면 아래가 모두 따라온다 —
+  // handLinkTick()의 hasMasterMac 게이트, HandScanCallbacks의 MAC 비교,
+  // characteristic ...459의 READ 응답까지.
+  memcpy(masterMac, MARK7_MAC_FORCED, sizeof(masterMac));
+  hasMasterMac = true;
+  Serial.printf(
+    "# PAIR: [OVERRIDE] NVS 무시하고 강제 MAC 사용 %02X:%02X:%02X:%02X:%02X:%02X\n",
+    masterMac[0], masterMac[1], masterMac[2],
+    masterMac[3], masterMac[4], masterMac[5]
+  );
+#endif
 }
 
 // PC에게 Pairing 결과를 보내는 함수
@@ -188,6 +252,13 @@ void notifyPairResult(const char* msg) {
 #define BLE_WEIGHT_BUF_MAX (4 + 4 + WEIGHTS_TOTAL_BYTES + 4)
 static uint8_t bleWeightBuf[BLE_WEIGHT_BUF_MAX];
 static size_t  bleWeightBufLen = 0;
+
+// 마지막 청크 도착 시각. 연결은 살아 있는데 앱이 전송을 중단하면(앱 크래시,
+// 사용자 이탈) 버퍼가 영구히 남고, 다음 전송의 첫 청크가 거기에 이어붙는다.
+// 이때 버퍼 앞의 **옛 매직넘버**가 그대로 남아 있어서 검사를 통과해버리므로
+// 다음 전송이 한 번은 반드시 실패한다. 일정 시간 청크가 없으면 버린다.
+#define BLE_WEIGHT_IDLE_TIMEOUT_MS 5000
+static uint32_t bleWeightLastChunkMs = 0;
 
 // characteristic 3의 NOTIFY로 결과 문자열 전송
 void notifyWeightsResult(const char* msg) {
@@ -215,6 +286,8 @@ class WeightsCharCallbacks : public BLECharacteristicCallbacks {
     String chunk = c->getValue();
     const uint8_t* data = (const uint8_t*)chunk.c_str();
     size_t len = chunk.length();
+
+    bleWeightLastChunkMs = millis();   // 수신 타임아웃 감시용 (loop()에서 판정)
 
     if (bleWeightBufLen + len > BLE_WEIGHT_BUF_MAX) {
       Serial.println("# BLE: 가중치 수신 버퍼 초과 — 리셋");
@@ -352,6 +425,7 @@ class PairCharCallbacks : public BLECharacteristicCallbacks  {
 uint8_t txBuffer[PACKET_SIZE];
 volatile uint32_t sampleCounter = 0;
 
+// 모드 전환은 여기서 하지 않음 
 class MyServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer* pServer) {
     deviceConnected = true;
@@ -436,6 +510,456 @@ static const int N_TIMING_INF = 20;
 #define DEBUG_ADC_STATS      0
 #define DEBUG_INFER_LATENCY  0
 
+// 모드 전환 (슬레이브 ↔ 마스터)
+enum ArmbandMode { MODE_SLAVE, MODE_MASTER };
+enum HandLinkState { HAND_IDLE, HAND_CONNECTING, HAND_READY };
+
+static ArmbandMode mode = MODE_SLAVE;
+static HandLinkState handState = HAND_IDLE;
+
+static BLEClient* pHandClient = nullptr;
+static BLERemoteCharacteristic* pHandCmd    = nullptr;  // CMD 송신 (FFF2 또는 FFE1)
+static BLERemoteCharacteristic* pHandStatus = nullptr;  // STATUS 수신 (FFF1 또는 FFE1)
+static BLEAdvertisedDevice* pHandFound = nullptr;
+
+static volatile bool handConnected = false;
+static uint32_t handNextTryMs = 0;
+static uint32_t handRetryMs = HAND_RETRY_MS_MIN;
+
+void setStatusLed(uint8_t r, uint8_t g, uint8_t b) {
+  for (int j = 0; j < 4; ++j) strip.setPixelColor(j, r, g, b);
+  strip.show();
+}
+
+// handState는 loop()만 쓰게 하고, 콜백은 handConnected만 건드린다. (writer를 하나로 유지 → 상태 경합 없음) 
+class HandClientCallbacks : public BLEClientCallbacks {
+  void onConnect(BLEClient*) override {
+    handConnected = true;
+  }
+  void onDisconnect(BLEClient*) override {
+    handConnected = false;   // 재탐색 전이는 handLinkTick()이 감지해서 처리 
+  }
+};
+static HandClientCallbacks handClientCb;
+
+// ── NimBLE 주소 바이트 순서 ──────────────────────────────────────────────
+// 이 코어(esp32 3.3.11)는 build/sdkconfig에 CONFIG_NIMBLE_ENABLED=y로 빌드된다
+// (Bluedroid 아님 — BLEDevice.h 등 API 이름은 같아도 내부는 NimBLE 래퍼다).
+//
+// NimBLE 분기에서 BLEAddress 내부 저장은 사람이 읽는 순서와 **반대**다:
+//   - BLEScan.cpp:643  `BLEAddress advertisedAddress(disc.addr)` 가
+//     `ble_addr_t.val`(wire order, LSB 옥텟이 먼저)을 그대로 memcpy
+//   - BLEAddress.cpp   `toString()`이 NimBLE에서는 `m_address[5..0]` 순서로
+//     출력해서 사람이 읽는 표기와 맞춰준다
+//   → getNative()[i] == (사람이 읽는 순서의 MAC)[5-i]
+//
+// masterMac/MARK7_MAC_FORCED는 항상 사람이 읽는 순서(§4-2 "정순")로 들고
+// 있으므로, getNative()와 그대로 memcmp하면 실제 기기와 절대 일치하지 않는다
+// (MAC이 우연히 팔린드롬이 아닌 이상 100% 실패). 반드시 이 함수로 비교할 것.
+bool nativeAddrMatchesHandMac(const uint8_t* native) {
+  for (int i = 0; i < 6; i++) {
+    if (native[i] != masterMac[5 - i]) return false;
+  }
+  return true;
+}
+
+// 저장된 MAC과 일치하는 광고만 잡는다.
+class HandScanCallbacks : public BLEAdvertisedDeviceCallbacks {
+  // 코어 3.3.11의 시그니처는 **값 전달**이다 (BLEAdvertisedDevice.h:215
+  // `virtual void onResult(BLEAdvertisedDevice advertisedDevice) = 0;`).
+  // 포인터로 쓰면 override가 안 붙어 클래스가 추상 타입으로 남는다.
+  void onResult(BLEAdvertisedDevice dev) override {
+    if (!hasMasterMac) return;
+    if (!nativeAddrMatchesHandMac(dev.getAddress().getNative())) return;
+    if (pHandFound) delete pHandFound;
+    pHandFound = new BLEAdvertisedDevice(dev);
+    BLEDevice::getScan()->stop();
+  }
+};
+static HandScanCallbacks handScanCb;
+
+void backoffHand() {
+  handNextTryMs = millis() + handRetryMs;
+  if (handRetryMs < HAND_RETRY_MS_MAX) handRetryMs *=2;
+  if (handRetryMs > HAND_RETRY_MS_MAX) handRetryMs = HAND_RETRY_MS_MAX;
+}
+
+// ── 의수 명령 패킷 만들기 ───────────────────────────────────────────────
+// hand.py::build_cmd()의 C++ 대응. PC 프로그램과 **바이트 단위로 같아야** 한다.
+//
+// 테스트 벡터 — PC 코드(ble/hand.py::build_cmd)를 직접 실행해 얻은 기준값이다.
+// 이 함수를 고친 뒤에는 아래와 같은 바이트열이 나오는지 확인할 것:
+//
+//   rest  build_cmd(0x1E,0x70,0x70,{0,0x90,0x90,0x90,0x90,0}, RELEASE=2)
+//         → FF 1E 70 70 00 90 90 90 90 00 02 1C
+//   close build_cmd(0x1E,0x70,0x70,{0,0x90,0x90,0x90,0x90,0}, GRASP=1)
+//         → FF 1E 70 70 00 90 90 90 90 00 01 1F
+//   reset build_cmd(0x3F,0x00,0x00,{0,0,0,0,0,0},        RESET=4)
+//         → FF 3F 00 00 00 00 00 00 00 00 04 3B
+//
+// 앞 두 개는 send_cmd.py의 'F2~F5 GRASP/RELEASE' 프리셋, 세 번째는
+// '전체 RESET_POWER' 프리셋과 같다 (test_protocol.py:72도 같은 벡터를 쓴다).
+void buildMark7Cmd(uint8_t out[MARK7_CMD_LEN],
+                   uint8_t finger_sel, uint8_t speed, uint8_t current,
+                   const uint8_t pos[6], uint8_t dir) {
+  out[0] = MARK7_HDR_CMD;
+  out[1] = finger_sel;
+  out[2] = speed;
+  out[3] = current;
+  for (int i = 0; i < 6; ++i) out[4 + i] = pos[i];
+  out[10] = dir;
+
+  uint8_t chk = 0;
+  for (int i = 1; i <= 10; ++i) chk ^= out[i];   // 헤더 제외, byte 1~10
+  out[MARK7_CMD_LEN - 1] = chk;
+}
+
+static const uint8_t MARK7_POS_GRASP[6] = {0, 0x90, 0x90, 0x90, 0x90, 0};
+static const uint8_t MARK7_POS_ZERO[6]  = {0, 0, 0, 0, 0, 0};
+
+// 전체 RESET_POWER — send_cmd.py의 '전체 RESET_POWER' 프리셋과 동일
+void buildMark7Reset(uint8_t out[MARK7_CMD_LEN]) {
+  buildMark7Cmd(out, 0x3F, 0x00, 0x00, MARK7_POS_ZERO, MARK7_DIR_RESET);
+}
+
+// ── 제스처 → 의수 명령 ──────────────────────────────────────────────────
+// ※ 여기는 **제품 결정이 필요한 지점**이다. 암밴드는 6개 제스처를 인식하지만
+//   MARK7은 손가락 6 DOF(F1~F5 + 엄지외전)만 있고 **손목 관절이 없다.** 그래서
+//   손목 계열 제스처(flexion/extension/supination/pronation)는 대응할 모터가
+//   아예 없다. 임의로 매핑하면 의수가 의도와 무관하게 움직이므로, 확정되기
+//   전까지는 보내지 않는다(false 반환).
+//
+// 반환값: 보낼 명령이 있으면 true.
+bool buildGestureCmd(int pred, uint8_t out[MARK7_CMD_LEN]) {
+  switch (pred) {
+    case 0:  // rest — 손 펴기
+      buildMark7Cmd(out, 0x1E, 0x70, 0x70, MARK7_POS_GRASP, MARK7_DIR_RELEASE);
+      return true;
+    case 3:  // close — 손 쥐기
+      buildMark7Cmd(out, 0x1E, 0x70, 0x70, MARK7_POS_GRASP, MARK7_DIR_GRASP);
+      return true;
+    default: // 1 flexion, 2 extension, 4 supination, 5 pronation — TODO 미정
+      return false;
+  }
+}
+
+
+// 의수로 보낸 12바이트를 시리얼에 남긴다. CHIPSEN 모듈을 PC USB에 물려놓고
+// 테스트할 때, 암밴드가 보낸 바이트와 PC 시리얼 툴에 도착한 바이트를 직접
+// 대조할 수 있다(양쪽이 같아야 BLE 구간이 정상).
+void logHandTx(const uint8_t* cmd, const char* tag) {
+  Serial.print("# HAND TX:");
+  for (int i = 0; i < MARK7_CMD_LEN; i++) Serial.printf(" %02X", cmd[i]);
+  Serial.printf("  (%s)\n", tag);
+}
+
+
+// ── 의수 수신 (STATUS / ACK) ────────────────────────────────────────────
+// 프레임 형식 (hand.py:1-8, parse_status()):
+//   STATUS 36B : 온도[6] + 전류평균[6×2 BE] + 회전량[6×2 BE signed] + EMG[2×2 BE] + XOR
+//   ACK     5B : "SETok"  (SET 수신 응답. CMD에는 ACK가 없다)
+//
+// ★ 조각 재조립이 필요하다. 의수 모듈은 HM-10/CC254x 계열로 MTU 23에 묶여
+//   있고 협상을 하지 않으므로 notify 페이로드가 **20바이트**로 잘린다. 36B
+//   STATUS는 실제로 20B + 16B **두 번**에 나눠 도착한다
+//   (상향흐름_모터에서_PC까지.md ⑤). 잘리는 위치는 값 한복판일 수 있어서
+//   조각을 그대로 해석하면 안 되고, 이어붙인 뒤 해석해야 한다.
+//
+//   같은 이유로 우리가 **보내는** CMD도 20바이트를 넘으면 쪼개진다. 12바이트라
+//   한 번에 들어가지만, MTU는 양쪽의 최솟값이므로 암밴드의 setMTU(247)은
+//   이 링크에서는 효력이 없다.
+//
+// ★ 프레임에 헤더도 길이 표시도 없어서 경계를 길이로만 잡는다(hand.py와 동일).
+//   상향 경로에는 재동기 장치가 없으므로(같은 문서 표), 조각이 한동안 끊기면
+//   잔여물을 버려 다음 프레임이 어긋나지 않게 한다.
+#define HAND_RX_BUF_MAX  96
+#define HAND_RX_IDLE_MS  100   // STATUS는 20ms 주기라 이보다 긴 공백은 단절이다
+
+static uint8_t  handRxBuf[HAND_RX_BUF_MAX];
+static size_t   handRxLen = 0;
+static uint32_t handRxLastMs = 0;
+static uint32_t handStatusCount = 0;
+
+// STATUS는 20ms 루프마다 올라와 약 50Hz다. 매 프레임 찍으면 시리얼이 넘쳐
+// 로그를 읽을 수 없으므로 1초에 한 번만 찍고, 그 사이 수신 건수(fps)를 함께
+// 보여준다. fps가 50 근처면 링크가 정상 속도로 살아 있다는 뜻이다.
+void logHandStatus(const uint8_t* s) {
+  static uint32_t lastLogMs = 0;
+  static uint32_t lastCount = 0;
+  uint32_t now = millis();
+  if (now - lastLogMs < 1000) return;
+
+  unsigned fps = (unsigned)(handStatusCount - lastCount);
+  lastCount = handStatusCount;
+  lastLogMs = now;
+
+  // mturn(회전량)은 부호 있는 16bit이고, 구동기가 실제로 움직였는지 보여준다.
+  // CMD가 먹었는지 확인할 때 온도보다 이게 결정적이다 — 명령 전후로 값이
+  // 변하면 전달이 확인된 것이다.
+  int16_t turn[6];
+  for (int i = 0; i < 6; i++) {
+    turn[i] = (int16_t)((s[18 + i * 2] << 8) | s[19 + i * 2]);
+  }
+
+  Serial.printf("# HAND RX: STATUS %ufps  temp=%u,%u,%u,%u,%u,%u"
+                "  turn=%d,%d,%d,%d,%d,%d  emg=%u,%u\n",
+                fps, s[0], s[1], s[2], s[3], s[4], s[5],
+                turn[0], turn[1], turn[2], turn[3], turn[4], turn[5],
+                (unsigned)((s[30] << 8) | s[31]),
+                (unsigned)((s[32] << 8) | s[33]));
+}
+
+// BLE 스택 태스크에서 호출되므로 짧게만 유지한다 — 재연결·파일IO 같은 무거운
+// 처리를 여기서 하면 스택이 막힌다(pendingRestart 패턴과 같은 이유).
+void onHandNotify(BLERemoteCharacteristic*, uint8_t* d, size_t len, bool) {
+  uint32_t now = millis();
+
+  if (handRxLen > 0 && now - handRxLastMs > HAND_RX_IDLE_MS) {
+    handRxLen = 0;   // 단절 후 잔여물 폐기 (재동기)
+  }
+  handRxLastMs = now;
+
+  if (handRxLen + len > HAND_RX_BUF_MAX) handRxLen = 0;
+  memcpy(handRxBuf + handRxLen, d, len);
+  handRxLen += len;
+
+  // 떼어낼 수 있는 프레임을 모두 처리
+  for (;;) {
+    if (handRxLen >= 5 && memcmp(handRxBuf, "SETok", 5) == 0) {
+      Serial.println("# HAND RX: ACK(SETok)");
+      memmove(handRxBuf, handRxBuf + 5, handRxLen - 5);
+      handRxLen -= 5;
+      continue;
+    }
+    if (handRxLen >= MARK7_STATUS_LEN) {
+      handStatusCount++;
+      logHandStatus(handRxBuf);
+      memmove(handRxBuf, handRxBuf + MARK7_STATUS_LEN, handRxLen - MARK7_STATUS_LEN);
+      handRxLen -= MARK7_STATUS_LEN;
+      continue;
+    }
+    break;
+  }
+}
+
+
+// ── 의수 GATT 해석 ──────────────────────────────────────────────────────
+
+// 연결된 의수의 service/characteristic을 전부 시리얼로 출력한다. 후보 UUID가
+// 하나도 안 맞을 때 실물이 무엇을 갖고 있는지 확인할 유일한 창구다.
+void dumpHandGatt() {
+  Serial.println("# ── HAND GATT ──────────────────");
+  std::map<std::string, BLERemoteService*>* services = pHandClient->getServices();
+  if (!services || services->empty()) {
+    Serial.println("#   (service 없음)");
+    return;
+  }
+  for (auto& sp : *services) {
+    BLERemoteService* svc = sp.second;
+    Serial.printf("#  service %s\n", svc->getUUID().toString().c_str());
+    std::map<std::string, BLERemoteCharacteristic*>* chars = svc->getCharacteristics();
+    if (!chars) continue;
+    for (auto& cp : *chars) {
+      BLERemoteCharacteristic* ch = cp.second;
+      Serial.printf("#    char %s  [%s%s%s%s]\n",
+                    ch->getUUID().toString().c_str(),
+                    ch->canRead()            ? "R" : "",
+                    ch->canWrite()           ? "W" : "",
+                    ch->canWriteNoResponse() ? "w" : "",
+                    ch->canNotify()          ? "N" : "");
+    }
+  }
+  Serial.println("# ───────────────────────────────");
+}
+
+// FFF2(송신)와 FFF1(수신)을 잡고 STATUS 구독까지 처리한다. 구독(CCCD write)은
+// 클라이언트(암밴드)가 서버(의수)에게 하는 동작이고, reference/pairing.png의
+// "데이터 구독 설정" 화살표가 열어주는 채널이 이것이다.
+bool resolveHandChars() {
+  pHandCmd    = nullptr;
+  pHandStatus = nullptr;
+
+  BLERemoteService* svc = pHandClient->getService(MARK7_SERVICE_UUID);
+  if (!svc) {
+    Serial.println("# HAND: service FFF0 없음 — 위 GATT 덤프 확인");
+    return false;
+  }
+
+  pHandCmd = svc->getCharacteristic(MARK7_CMD_UUID);
+  if (!pHandCmd) {
+    Serial.println("# HAND: characteristic FFF2 없음 — 위 GATT 덤프 확인");
+    return false;
+  }
+
+  pHandStatus = svc->getCharacteristic(MARK7_STATUS_UUID);
+  if (pHandStatus && pHandStatus->canNotify()) {
+    pHandStatus->registerForNotify(onHandNotify);  // CCCD 0x0001 write까지 함께 처리됨
+    Serial.println("# HAND: STATUS(FFF1) 구독 완료");
+  } else {
+    pHandStatus = nullptr;
+    Serial.println("# HAND: STATUS(FFF1) 없음 — 수신 없이 명령만 전송");
+  }
+  return true;
+}
+
+// MASTER → SLAVE 모드 전환 (폰에 붙은 경우)
+void enterSlaveMode() {
+  Serial.println("# MODE: MASTER -> SLAVE (폰 연결)");
+
+  // 의수가 마지막 제스처를 잡은 채로 두지 않기 위해 정지 명령을 먼저 보냄.
+  // 모드 전환 시 1회뿐이라 with-response(true)로 보낸다 — 전달을 확인한 뒤
+  // 끊어야 명령이 유실되지 않는다. 20Hz 경로와 달리 여기서는 블로킹이 허용됨.
+  if (handConnected && pHandCmd) {
+    uint8_t cmd[MARK7_CMD_LEN];
+    buildMark7Reset(cmd);
+    if (!pHandCmd->writeValue(cmd, MARK7_CMD_LEN, true)) {
+      Serial.println("# HAND: RESET 전송 실패");
+    }
+  }
+
+  if (pHandClient && pHandClient->isConnected()) pHandClient->disconnect();
+
+  handConnected = false;
+  pHandCmd    = nullptr;
+  pHandStatus = nullptr;
+  handRxLen   = 0;          // 재조립 버퍼 비우기 (조각이 남으면 다음 연결의 첫 프레임이 어긋난다)
+  handState = HAND_IDLE;
+  handRetryMs = HAND_RETRY_MS_MIN;
+  if (pHandFound) { delete pHandFound; pHandFound = nullptr; }
+
+  // 폰이 이미 연결된 상태라 컨트롤러가 광고를 꺼둔게 정상 
+  setStatusLed(0, 0, 16);   // 파랑 = SLAVE
+}
+
+// SLAVE → MASTER 모드 전환 (폰이 끊긴 경우 MARK7 탐색 시작)
+void enterMasterMode() {
+  Serial.println("# MODE: SLAVE -> MASTER (폰 끊김)"); 
+  handState = HAND_IDLE;
+  handRetryMs = HAND_RETRY_MS_MIN;
+  handNextTryMs = millis() + MASTER_ENTRY_DELAY_MS;
+  setStatusLed(16, 8, 0);   // 노랑 = MARK7 탐색 대기 
+}
+
+// MASTER 모드에서만 호출 (스캔 → connect → service discovery)
+void handLinkTick() {
+  // READY였는데 링크가 끊긴 경우 → 재탐색으로 
+  if (handState == HAND_READY && !handConnected) {
+    Serial.println("# HAND: 링크 끊김 — 재탐색");
+    pHandCmd    = nullptr;
+    pHandStatus = nullptr;
+    handRxLen = 0;            // 재조립 버퍼 초기화 — 다음 연결이 깨끗하게 시작되게
+    handState = HAND_IDLE;
+    setStatusLed(16, 8, 0);
+    backoffHand();
+  }
+
+  if (handState == HAND_READY) return;
+  if (!hasMasterMac) return;              // 페어링 안 됐으면 아무것도 안함 
+  if (millis() < handNextTryMs) return;
+
+  switch (handState) {
+    case HAND_IDLE: {
+      if (pHandFound) { delete pHandFound; pHandFound = nullptr; }
+
+      BLEDevice::stopAdvertising();    // 스캔 동안 라디오 경합 제거
+
+      BLEScan* s = BLEDevice::getScan();
+      s->setAdvertisedDeviceCallbacks(&handScanCb, false);
+      s->setActiveScan(true);
+      s->start(SCAN_SECONDS, false);
+      s->stop();
+      s->clearResults();
+
+      // 스캔 중에 폰이 붙는 경우 → 다음 modeTick()이 SLAVE로 보낸다
+      if (deviceConnected) return;
+
+      if (pHandFound) {
+        handState = HAND_CONNECTING;    // connect 까지는 광고를 끈 채로 진행 
+      } else {
+        Serial.println("# HAND: MARK7 못 찾음");
+        BLEDevice::startAdvertising();    // backoff 동안은 폰이 들어올 수 있게
+        backoffHand();
+      }
+      break;
+    }
+
+    case HAND_CONNECTING: {
+      if (!pHandClient) {
+        pHandClient = BLEDevice::createClient();
+        pHandClient->setClientCallbacks(&handClientCb);
+      }
+
+      bool ok = pHandClient->connect(pHandFound);   // 블로킹 
+
+      if (deviceConnected) {
+        if (ok) pHandClient->disconnect();
+        return;
+      }
+
+      if (ok) {
+        // 실물 GATT 구조를 항상 남긴다 — 박아둔 FFF0/FFF1/FFF2가 맞는지
+        // 첫 연결 로그에서 바로 확인된다.
+        dumpHandGatt();
+
+        if (resolveHandChars()) {
+          handState = HAND_READY;
+          handRetryMs = HAND_RETRY_MS_MIN;
+          BLEDevice::startAdvertising();    // 연결 성공(광고 다시 켜서 폰 진입로 유지)
+          setStatusLed(0, 16, 0);           // 초록 = MASTER 동작 중
+          Serial.println("# HAND: ready - MASTER 모드 동작");
+          break;
+        }
+        Serial.println("# HAND: 후보 UUID 중 맞는 것 없음 — 위 GATT 덤프 참고");
+        pHandClient->disconnect();
+      } else {
+        Serial.println("# HAND: connect 실패");
+      }
+      BLEDevice::startAdvertising();   // 실패 경로 - 반드시 다시 켬
+      handState = HAND_IDLE;
+      backoffHand();
+      break;
+    }
+
+    default: break;
+  }
+}
+
+#if MARK7_TEST_SWEEP
+// 추론·가중치 없이 CMD 송신 경로만 검증한다. MARK7_TEST_SWEEP_MS마다
+// rest(RELEASE) ↔ close(GRASP)를 번갈아 보낸다.
+void handTestSweep() {
+  if (handState != HAND_READY || !pHandCmd) return;
+
+  static uint32_t lastMs = 0;
+  static bool grasp = false;
+  if (millis() - lastMs < MARK7_TEST_SWEEP_MS) return;
+  lastMs = millis();
+
+  uint8_t cmd[MARK7_CMD_LEN];
+  buildGestureCmd(grasp ? 3 : 0, cmd);   // 3=close, 0=rest
+  pHandCmd->writeValue(cmd, MARK7_CMD_LEN, false);
+  logHandTx(cmd, grasp ? "SWEEP close" : "SWEEP rest");
+  grasp = !grasp;
+}
+#endif
+
+// loop()에서 매번 호출 (모드 판정은 deciceConnected 하나로 끝냄)
+void modeTick() {
+  ArmbandMode want = deviceConnected ? MODE_SLAVE : MODE_MASTER;
+
+  if (want != mode) {
+    if (want == MODE_SLAVE) enterSlaveMode();
+    else                    enterMasterMode();
+    mode = want;
+  }
+
+  if (mode == MODE_MASTER) {
+    handLinkTick();
+#if MARK7_TEST_SWEEP
+    handTestSweep();
+#endif
+  }
+}
 
 // =========================
 // SETUP (IDENTICAL TO RECORDER except final NN init)
@@ -543,6 +1067,10 @@ void setup() {
   BLEDevice::startAdvertising();
 
   Serial.println("BLE Advertising Started");
+
+  // 부팅 직후엔 폰이 없으므로 첫 modeTick()에서 MASTER로 넘어감 
+  mode = MODE_SLAVE;
+  setStatusLed(0, 0, 16);
 
   delay(100);
   for (int j = 0; j < 4; ++j) {
@@ -700,13 +1228,32 @@ void runInference() {
   Serial.println();
 
   // BLE notify the prediction (format: "classname|l0|l1|l2|l3")
-  if (deviceConnected) {
+  if (mode == MODE_SLAVE && deviceConnected) {
+
+    // SLAVE: 폰으로 notify
     char pred_msg[80];
     snprintf(pred_msg, sizeof(pred_msg), "%s|%.3f|%.3f|%.3f|%.3f|%.3f|%.3f",
              CLASS_NAMES[final_pred],
              logits[0], logits[1], logits[2], logits[3], logits[4], logits[5]);
     pCharacteristicPred->setValue((uint8_t*)pred_msg, strlen(pred_msg));
     pCharacteristicPred->notify();
+
+  } else if (mode == MODE_MASTER && handState == HAND_READY && pHandCmd) {
+    // MASTER: MARK7로 제스처 명령
+    static int        lastSentPred = -1;
+    static uint32_t   lastSendMs   = 0;
+    if (final_pred != lastSentPred || millis() - lastSendMs > HAND_KEEPALIVE_MS) {
+      uint8_t cmd[MARK7_CMD_LEN];
+      // 매핑이 없는 제스처(손목 계열)는 아무것도 보내지 않는다 — buildGestureCmd() 주석 참고
+      if (buildGestureCmd(final_pred, cmd)) {
+        // 20Hz 경로이므로 no-response. with-response는 connection interval만큼
+        // 블로킹해서 781µs 샘플링 루프를 깨뜨린다.
+        pHandCmd->writeValue(cmd, MARK7_CMD_LEN, false);
+        logHandTx(cmd, CLASS_NAMES[final_pred]);
+      }
+      lastSentPred = final_pred;
+      lastSendMs = millis();
+    }
   }
 
   // Aggregate stats
@@ -836,7 +1383,22 @@ void loop() {
 
   checkWeightReceiveUsb();
 
+  // 가중치 수신이 중간에 멈춘 채 방치된 경우 버퍼를 버린다. 응답은 문서에
+  // 이미 정의된 ERR:SIZE를 쓴다("LENGTH 필드와 실제 수신 바이트 수 불일치" —
+  // 정확히 이 상황이고, 안드로이드가 이미 처리하는 코드다).
+  if (bleWeightBufLen > 0 &&
+      millis() - bleWeightLastChunkMs > BLE_WEIGHT_IDLE_TIMEOUT_MS) {
+    Serial.println("# BLE: 가중치 수신 타임아웃 — 버퍼 폐기");
+    resetBleWeightReceive();
+    notifyWeightsResult("ERR:SIZE");
+  }
+
   shutdownOnSwitch();
+
+  // 폰 연결 여부에 따라 SLAVE/MASTER를 판정하고, MASTER면 MARK7 링크를
+  // 진행한다. shutdownOnSwitch() 뒤에 두는 이유: 스캔이 최대 SCAN_SECONDS초
+  // 블로킹하므로 그 직전에 전원 스위치를 한 번 확인해두는 편이 낫다.
+  modeTick();
 
   int pos = getEMG();
 
