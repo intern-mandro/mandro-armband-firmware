@@ -45,7 +45,8 @@ class Preprocessor {
 public:
     Preprocessor();
 
-    // Main pipeline: raw int samples -> 58 standardized features.
+    // Main pipeline: raw int samples -> N_FEATURES standardized features
+    // (132 for the current 8ch config; 58 was the old 4ch config).
     // emg_window: WINDOW_SIZE rows x N_CHANNEL columns (int16 from ADC).
     // out_features: must point to at least N_FEATURES floats.
     void process(int16_t emg_window[WINDOW_SIZE][N_CHANNEL],

@@ -18,8 +18,9 @@
  *   - Same BLE service / characteristic / notify timing (1280 Hz target)
  *   - Same power switch handling
  *
- * The model is the 4-class concat132 model trained at fs=1200 Hz on the
- * same hardware. Class names: rest, flexion, extension, close.
+ * The model is the 6-class concat132 model trained at fs=1200 Hz on the
+ * same hardware. Class names: rest, flexion, extension, close, supination,
+ * pronation (see CLASS_NAMES / MODEL_TOPOLOGY — 4-class was the old 4ch model).
  */
 
 #include <BLEDevice.h>
@@ -428,6 +429,13 @@ static uint32_t t_preproc_max = 0, t_nn_max = 0;
 static int      infer_latency_count = 0;
 static const int N_TIMING_INF = 20;
 
+// 디버그 출력 스위치 (1로 바꾸면 켜짐). 이전엔 `if (false & <조건>)` 형태로
+// 껐는데, `&`가 `==`/`>=`보다 우선순위가 낮아서 실제로는 `false & (조건)`이
+// 아니라 컴파일러 경고 없이 항상 거짓인 죽은 코드였다. 의도를 명시적으로
+// 드러내려고 상수 플래그로 바꿨다 (0이면 최적화 단계에서 통째로 빠진다).
+#define DEBUG_ADC_STATS      0
+#define DEBUG_INFER_LATENCY  0
+
 
 // =========================
 // SETUP (IDENTICAL TO RECORDER except final NN init)
@@ -548,7 +556,7 @@ void setup() {
       infer_buffer[n][c] = 0;
     }
   }
-  Serial.println("# hybrid sketch: recorder + inference 4-class");
+  Serial.println("# hybrid sketch: recorder + inference 6-class");
   Serial.printf("# inference window=%d, hop=%d, vote=%d\n",
                 WINDOW_SIZE, INFER_HOP, N_VOTE);
 
@@ -601,10 +609,15 @@ int getEMG() {
 // =========================
 // NEW: Inference routine
 // =========================
+// vote_buf는 시프트 레지스터다 — runInference()가 값을 왼쪽으로 밀고 최신
+// 예측을 항상 vote_buf[N_VOTE-1]에 넣는다. 따라서 아직 다 안 채워진 워밍업
+// 구간(vote_count < N_VOTE)에 세야 할 것은 앞쪽이 아니라 **뒤쪽** n_seen개다.
+// 앞쪽을 세면 한 번도 쓰이지 않은 0(= class 0 "rest")이 표에 섞여 부팅 직후
+// 두 번의 추론이 rest 쪽으로 끌려간다.
 int getMostFrequent() {
   int counts[N_CLASSES] = {0};
   int n_seen = (vote_count < N_VOTE) ? vote_count : N_VOTE;
-  for (int i = 0; i < n_seen; i++) {
+  for (int i = N_VOTE - n_seen; i < N_VOTE; i++) {
     int p = vote_buf[i];
     if (p >= 0 && p < N_CLASSES) counts[p]++;
   }
@@ -615,8 +628,11 @@ int getMostFrequent() {
       best = i;
     }
   }
+  // 과반이 없으면 최신 예측으로 폴백. 최신은 항상 마지막 슬롯이다 — 이전엔
+  // vote_buf[(vote_count-1) % N_VOTE]였는데 vote_count가 N_VOTE로 포화된
+  // 뒤에만 우연히 맞고, 워밍업 2회는 엉뚱한 슬롯을 읽었다.
   if (best_count < VOTE_THRESHOLD * N_VOTE) {
-    return vote_buf[(vote_count - 1) % N_VOTE];
+    return vote_buf[N_VOTE - 1];
   }
   return best;
 }
@@ -654,7 +670,7 @@ void runInference() {
 
   // Debug ADC stats every 5 inferences
   static int adc_dbg = 0;
-  if (false & (++adc_dbg % 5) == 0) {
+  if (DEBUG_ADC_STATS && (++adc_dbg % 5) == 0) {
     Serial.print("[ADC] ");
     for (int ch = 0; ch < N_CHANNEL; ch++) {
       int mn = 999, mx = -999;
@@ -701,7 +717,7 @@ void runInference() {
   infer_latency_count++;
   infer_count++;
 
-  if (false & infer_latency_count >= N_TIMING_INF) {
+  if (DEBUG_INFER_LATENCY && infer_latency_count >= N_TIMING_INF) {
     Serial.print("LATENCY us [");
     Serial.print(infer_latency_count);
     Serial.print(" inf] | mean: preproc=");
