@@ -260,6 +260,15 @@ static size_t  bleWeightBufLen = 0;
 #define BLE_WEIGHT_IDLE_TIMEOUT_MS 5000
 static uint32_t bleWeightLastChunkMs = 0;
 
+// PAYLOAD+CRC32가 다 모였다는 표시만 하는 플래그. 실제 CRC 검증과 53KB
+// LittleFS.write()는 onWrite()가 아니라 loop()에서 한다 — onWrite()는 BLE
+// 스택 자체의 태스크 컨텍스트에서 도는데, 그 안에서 53KB 동기 flash 쓰기를
+// 하면 BLE 스택이 그동안 멈춰서 연결 인터벌(7.5~15ms)을 여러 번 놓치고,
+// 브라운아웃/워치독으로 재부팅까지 발생한 사례가 있었다. loop()는 Arduino
+// 메인 태스크라 여기서 블로킹돼도 BLE 스택 자체의 타이밍에는 영향이 없다
+// (재부팅을 loop()로 미루는 pendingRestart와 같은 이유).
+static volatile bool pendingWeightSave = false;
+
 // characteristic 3의 NOTIFY로 결과 문자열 전송
 void notifyWeightsResult(const char* msg) {
   if (!deviceConnected) return;
@@ -270,6 +279,7 @@ void notifyWeightsResult(const char* msg) {
 // BLE 가중치 수신 상태 초기화 (연결 끊기거나 오류 시 호출)
 void resetBleWeightReceive() {
   bleWeightBufLen = 0;
+  pendingWeightSave = false;   // 저장 대기 중이던 것도 함께 취소
 }
 
 
@@ -283,6 +293,12 @@ static unsigned long restartAtMs = 0;
 
 class WeightsCharCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic* c) override { // Android가 244바이트씩 Write 할 때마다 이 onWrite()가 호출됨.
+    // 이미 저장 대기 중이면(직전 write로 다 모여서 loop()가 처리를 기다리는
+    // 중) 버퍼를 더 건드리지 않는다 — 여기서 더 받아버리면 overflow 검사에
+    // 걸려 resetBleWeightReceive()가 돌면서 loop()가 처리하기 전에 데이터가
+    // 날아간다.
+    if (pendingWeightSave) return;
+
     String chunk = c->getValue();
     const uint8_t* data = (const uint8_t*)chunk.c_str();
     size_t len = chunk.length();
@@ -326,22 +342,10 @@ class WeightsCharCallbacks : public BLECharacteristicCallbacks {
     size_t expectedTotal = 4 + 4 + declaredLen + 4;
     if (bleWeightBufLen < expectedTotal) return;  // 아직 다 안 옴, 다음 청크 기다림
 
-    // PAYLOAD + CRC32까지 다 도착 — 저장 시도
-    const uint8_t* payload = bleWeightBuf + 8;
-    uint32_t crcRecv;
-    memcpy(&crcRecv, bleWeightBuf + 8 + declaredLen, 4);
-
-    WeightSaveResult result = saveWeightsIfCrcOk(payload, declaredLen, crcRecv);
-    resetBleWeightReceive();
-
-    notifyWeightsResult(weightSaveResultStr(result));
-    if (result == WSAVE_OK) {
-      // 여기서 바로 재부팅하지 않음 — 이 콜백이 return해야 이번 write의 ATT
-      // 확인 응답이 나가고, NOTIFY도 정상적으로 전파됨. 재부팅은 loop()에
-      // 맡기고 이 콜백은 즉시 끝냄.
-      pendingRestart = true;
-      restartAtMs = millis() + 300;  // NOTIFY가 실제로 나갈 시간만 살짝 확보
-    }
+    // PAYLOAD + CRC32까지 다 도착했다. CRC 검증과 53KB flash 쓰기는 여기서
+    // 하지 않고 loop()에 넘긴다 — bleWeightBuf는 그대로 두고 표시만 세운다.
+    // 이 콜백은 바로 return해서 이번 write의 ATT 확인 응답이 즉시 나가게 함.
+    pendingWeightSave = true;
   }
 };
 
@@ -1378,6 +1382,28 @@ void loop() {
     ESP.restart();
   }
 
+  // onWrite()가 미뤄둔 실제 저장. CRC 검증(53KB 순회) + LittleFS.write(53KB)를
+  // 여기서 한다 — BLE 스택 태스크가 아니라 이 Arduino 메인 루프에서 블로킹돼야
+  // BLE 연결 인터벌을 안 놓친다. 전송 중 재부팅되던 문제가 이 지점이었다.
+  if (pendingWeightSave) {
+    pendingWeightSave = false;
+
+    uint32_t declaredLen;
+    memcpy(&declaredLen, bleWeightBuf + 4, 4);
+    const uint8_t* payload = bleWeightBuf + 8;
+    uint32_t crcRecv;
+    memcpy(&crcRecv, bleWeightBuf + 8 + declaredLen, 4);
+
+    WeightSaveResult result = saveWeightsIfCrcOk(payload, declaredLen, crcRecv);
+    resetBleWeightReceive();
+
+    notifyWeightsResult(weightSaveResultStr(result));
+    if (result == WSAVE_OK) {
+      pendingRestart = true;
+      restartAtMs = millis() + 300;  // NOTIFY가 실제로 나갈 시간만 살짝 확보
+    }
+  }
+
   static uint32_t tick = 0;
   tick = micros();
 
@@ -1386,7 +1412,9 @@ void loop() {
   // 가중치 수신이 중간에 멈춘 채 방치된 경우 버퍼를 버린다. 응답은 문서에
   // 이미 정의된 ERR:SIZE를 쓴다("LENGTH 필드와 실제 수신 바이트 수 불일치" —
   // 정확히 이 상황이고, 안드로이드가 이미 처리하는 코드다).
-  if (bleWeightBufLen > 0 &&
+  // pendingWeightSave 대기 중(=수신은 이미 완료, 저장 처리만 남음)에는 이
+  // 타임아웃을 적용하지 않는다 — bleWeightBufLen > 0인 게 정상 상태다.
+  if (!pendingWeightSave && bleWeightBufLen > 0 &&
       millis() - bleWeightLastChunkMs > BLE_WEIGHT_IDLE_TIMEOUT_MS) {
     Serial.println("# BLE: 가중치 수신 타임아웃 — 버퍼 폐기");
     resetBleWeightReceive();
