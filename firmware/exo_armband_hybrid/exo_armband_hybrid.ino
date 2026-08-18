@@ -28,7 +28,14 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include <LittleFS.h>
-#include <Preferences.h>    // 로봇 의수 MAC 주소를 ESP32의 NVS에 저장 
+#include <Preferences.h>    // 로봇 의수 MAC 주소를 ESP32의 NVS에 저장
+
+// connId는 있는데 isConnected=false인 반쪽짜리 링크(=BLEClient가 놓친 상태)를
+// forceDisconnectChipsen()에서 ble_gap_terminate()로 직접 끊기 위해 필요.
+#if defined(CONFIG_NIMBLE_ENABLED)
+#include <host/ble_hs.h>
+#include <host/ble_gap.h>
+#endif
 
 #include "preprocessor.h"
 #include "nn.h"
@@ -546,6 +553,27 @@ class HandClientCallbacks : public BLEClientCallbacks {
 };
 static HandClientCallbacks handClientCb;
 
+// isConnected()==false인데 connId만 남아있는 반쪽짜리 링크는 BLEClient::disconnect()가
+// (isConnected() 체크를 거치는 상위 래퍼라면) 놓칠 수 있다. ble_gap_terminate()는
+// connection handle만 있으면 그 상태와 무관하게 무조건 종료를 시도하는 저수준
+// NimBLE 호출이라, 여기서 그걸 직접 쓴다.
+void forceDisconnectChipsen() {
+  if (!pHandClient) return;
+
+  uint16_t connId = pHandClient->getConnId();
+
+#if defined(CONFIG_NIMBLE_ENABLED)
+  if (connId != BLE_HS_CONN_HANDLE_NONE) {
+    int rc = ble_gap_terminate(connId, BLE_ERR_REM_USER_CONN_TERM);
+    Serial.printf("# CHIPSEN: force disconnect connId=%u rc=%d\n", (unsigned)connId, rc);
+  }
+#else
+  if (pHandClient->isConnected()) {
+    pHandClient->disconnect();
+  }
+#endif
+}
+
 // ── NimBLE 주소 바이트 순서 ──────────────────────────────────────────────
 // 이 코어(esp32 3.3.11)는 build/sdkconfig에 CONFIG_NIMBLE_ENABLED=y로 빌드된다
 // (Bluedroid 아님 — BLEDevice.h 등 API 이름은 같아도 내부는 NimBLE 래퍼다).
@@ -811,17 +839,18 @@ void enterSlaveMode() {
   Serial.println("# MODE: MASTER -> SLAVE (폰 연결)");
 
   // 의수가 마지막 제스처를 잡은 채로 두지 않기 위해 정지 명령을 먼저 보냄.
-  // 모드 전환 시 1회뿐이라 with-response(true)로 보낸다 — 전달을 확인한 뒤
-  // 끊어야 명령이 유실되지 않는다. 20Hz 경로와 달리 여기서는 블로킹이 허용됨.
+  // 원래 with-response(true)로 보내서 전달을 확인한 뒤 끊으려 했는데, 이
+  // CHIPSEN류 모듈에서 with-response가 정상 응답하는지 검증된 적이 없다.
+  // 응답이 안 오면 이 호출이 블로킹돼서 밑의 disconnect()가 영영 실행이 안
+  // 되고(= MARK7 쪽에 +DISCONNECTED가 안 뜨는 증상과 일치), loop() 전체가
+  // 멈춘다. 20Hz 경로에서 이미 검증된 no-response로 통일해 그 위험을 없앤다.
   if (handConnected && pHandCmd) {
     uint8_t cmd[MARK7_CMD_LEN];
     buildMark7Reset(cmd);
-    if (!pHandCmd->writeValue(cmd, MARK7_CMD_LEN, true)) {
-      Serial.println("# HAND: RESET 전송 실패");
-    }
+    pHandCmd->writeValue(cmd, MARK7_CMD_LEN, false);
   }
 
-  if (pHandClient && pHandClient->isConnected()) pHandClient->disconnect();
+  forceDisconnectChipsen();   // isConnected=false인데 connId만 남은 반쪽짜리 링크도 확실히 끊는다
 
   handConnected = false;
   pHandCmd    = nullptr;
@@ -893,10 +922,11 @@ void handLinkTick() {
         pHandClient->setClientCallbacks(&handClientCb);
       }
 
-      bool ok = pHandClient->connect(pHandFound);   // 블로킹 
+      bool ok = pHandClient->connect(pHandFound);   // 블로킹
 
       if (deviceConnected) {
-        if (ok) pHandClient->disconnect();
+        forceDisconnectChipsen();   // isConnected=false인데 connId만 남은 반쪽짜리 링크도 확실히 끊는다
+        handState = HAND_IDLE;
         return;
       }
 
