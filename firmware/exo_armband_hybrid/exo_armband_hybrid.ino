@@ -35,6 +35,8 @@
 #if defined(CONFIG_NIMBLE_ENABLED)
 #include <host/ble_hs.h>
 #include <host/ble_gap.h>
+#include <host/ble_att.h>   // dumpConnDesc()에서 ble_att_mtu()로 실제 MTU를 읽기 위해 필요
+#include <nimble/ble.h>
 #endif
 
 #include "preprocessor.h"
@@ -65,7 +67,9 @@ static const char* CHARACTERISTIC_UUID_PRED  = "abcd1234-5678-1234-5678-abcdef12
 static const char* CHARACTERISTIC_UUID_WEIGHTS = "abcd1234-5678-1234-5678-abcdef123458"; // 가중치 수신
 static const char* CHARACTERISTIC_UUID_PAIR = "abcd1234-5678-1234-5678-abcdef123459";   // 페어링용 
 
-// MARK7(로봇 의수) BLE 모듈. MAC: 3C:A5:51:99:BB:5F
+// MARK7(로봇 의수) BLE 모듈. MAC: 5C:F2:86:49:3A:AA (AT 명령어로 실측 확인됨 —
+// 예전엔 3C:A5:51:99:BB:5F로 적혀있었는데 그건 다른 개체/오기였다. line 76
+// MARK7_MAC_FORCED가 실제 스캔 타겟이고 이 값과 일치함)
 //
 // 실물 GATT 구조 — reference/BLE_Scanner.png (기기명 CHIPSEN, NOT BONDED):
 
@@ -115,6 +119,7 @@ static const uint8_t MARK7_MAC_FORCED[6] = { 0x5C, 0xF2, 0x86, 0x49, 0x3A, 0xAA 
 #define HAND_RETRY_MS_MIN      1000
 #define HAND_RETRY_MS_MAX      30000
 #define HAND_KEEPALIVE_MS      500
+#define HAND_STATUS_TIMEOUT_MS 3000   // 이 시간 동안 STATUS(FFF1) notify가 한 번도 안 오면 경고
 
 // =========================
 // NEW: 가중치 수신 — 공통 로직 (USB/BLE 공용)
@@ -536,19 +541,145 @@ static BLEAdvertisedDevice* pHandFound = nullptr;
 static volatile bool handConnected = false;
 static uint32_t handNextTryMs = 0;
 static uint32_t handRetryMs = HAND_RETRY_MS_MIN;
+static uint32_t handReadyMs = 0;   // HAND_READY 진입 시각 — STATUS 무응답 워치독 기준점
 
 void setStatusLed(uint8_t r, uint8_t g, uint8_t b) {
   for (int j = 0; j < 4; ++j) strip.setPixelColor(j, r, g, b);
   strip.show();
 }
 
-// handState는 loop()만 쓰게 하고, 콜백은 handConnected만 건드린다. (writer를 하나로 유지 → 상태 경합 없음) 
+// GAP 이벤트 핸들러/connect() 디버그 로그가 공통으로 쓰는 헬퍼 — connection
+// handle 하나로 저수준 NimBLE이 실제로 들고 있는 연결 상태(interval, MTU 등)를
+// 조회해서 찍는다. BLEClient 래퍼의 ok/isConnected()와 무관하게, "진짜로 링크가
+// 있는지"를 ble_gap_conn_find()로 직접 확인하기 위한 용도.
+#if defined(CONFIG_NIMBLE_ENABLED)
+void dumpConnDesc(uint16_t connHandle, const char* tag) {
+  struct ble_gap_conn_desc desc;
+  int rc = ble_gap_conn_find(connHandle, &desc);
+  if (rc != 0) {
+    Serial.printf(
+      "### CONN_DESC [%s] handle=%u — ble_gap_conn_find rc=%d (%s) ###\n",
+      tag, connHandle, rc, BLEUtils::returnCodeToString(rc)
+    );
+    return;
+  }
+  BLEAddress peer(desc.peer_ota_addr);
+  Serial.printf(
+    "### CONN_DESC [%s] handle=%u peer=%s itvl=%u latency=%u timeout=%u role=%u mtu=%u ###\n",
+    tag, connHandle, peer.toString().c_str(),
+    desc.conn_itvl, desc.conn_latency, desc.supervision_timeout, desc.role,
+    ble_att_mtu(connHandle)
+  );
+}
+#endif
+
+// BLEDevice::setCustomGapHandler()로 등록하는 원시 GAP 이벤트 리스너 — BLEClient의
+// 내부 처리를 대체하는 게 아니라(ble_gap_event_listener_register()는 리스너를
+// 여러 개 등록 가능), 그 위에 관찰용으로 얹는 것. connect()가 FAIL인데 connId는
+// 남는 상황을 status/handle 단위로 직접 보기 위함.
+#if defined(CONFIG_NIMBLE_ENABLED)
+int bleGapDebug(struct ble_gap_event* event, void* arg) {
+  Serial.printf("### GAP EVENT type=%u ###\n", (unsigned)event->type);
+
+  switch (event->type) {
+
+    case BLE_GAP_EVENT_CONNECT:
+      Serial.printf(
+        "### GAP CONNECT: status=%d handle=%u ###\n",
+        event->connect.status,
+        event->connect.conn_handle
+      );
+      break;
+
+    case BLE_GAP_EVENT_MTU:
+      Serial.printf(
+        "### GAP MTU: handle=%u mtu=%u ###\n",
+        event->mtu.conn_handle,
+        event->mtu.value
+      );
+      break;
+
+    // ─────────────────────────────
+    // 4. 연결 파라미터 변경 요청
+    // ─────────────────────────────
+    case BLE_GAP_EVENT_CONN_UPDATE_REQ:
+      Serial.printf(
+        "### GAP CONN_UPDATE_REQ: handle=%u"
+        " min=%u max=%u latency=%u timeout=%u ###\n",
+        event->conn_update_req.conn_handle,
+        event->conn_update_req.peer_params->itvl_min,
+        event->conn_update_req.peer_params->itvl_max,
+        event->conn_update_req.peer_params->latency,
+        event->conn_update_req.peer_params->supervision_timeout
+      );
+      break;
+
+    // ─────────────────────────────
+    // 5. 암호화 / 보안 상태 변화
+    // ─────────────────────────────
+    case BLE_GAP_EVENT_ENC_CHANGE:
+      Serial.printf(
+        "### GAP ENC_CHANGE: handle=%u status=%d (%s) ###\n",
+        event->enc_change.conn_handle,
+        event->enc_change.status,
+        BLEUtils::returnCodeToString(event->enc_change.status)
+      );
+      dumpConnDesc(event->enc_change.conn_handle, "ENC_CHANGE");
+      break;
+
+    // ─────────────────────────────
+    // 6. Passkey / Pairing 요청
+    // ─────────────────────────────
+    case BLE_GAP_EVENT_PASSKEY_ACTION:
+      Serial.printf(
+        "### GAP PASSKEY_ACTION: handle=%u action=%u ###\n",
+        event->passkey.conn_handle,
+        event->passkey.params.action
+      );
+      break;
+
+    // ─────────────────────────────
+    // 7. 연결 종료
+    // ─────────────────────────────
+    case BLE_GAP_EVENT_DISCONNECT:
+      Serial.printf(
+        "### GAP DISCONNECT: handle=%u reason=%d (%s) ###\n",
+        event->disconnect.conn.conn_handle,
+        event->disconnect.reason,
+        BLEUtils::returnCodeToString(event->disconnect.reason)
+      );
+      break;
+
+    // ─────────────────────────────
+    // 8. 연결 종료 자체가 실패
+    // ─────────────────────────────
+    case BLE_GAP_EVENT_TERM_FAILURE:
+      Serial.printf(
+        "### GAP TERM_FAILURE: handle=%u status=%d (%s) ###\n",
+        event->term_failure.conn_handle,
+        event->term_failure.status,
+        BLEUtils::returnCodeToString(event->term_failure.status)
+      );
+      break;
+
+    default:
+      // 위에서 첫 줄에 type 번호는 이미 찍힘
+      break;
+  }
+
+  return 0;
+}
+#endif
+
+// handState는 loop()만 쓰게 하고, 콜백은 handConnected만 건드린다. (writer를 하나로 유지 → 상태 경합 없음)
 class HandClientCallbacks : public BLEClientCallbacks {
   void onConnect(BLEClient*) override {
     handConnected = true;
+    Serial.println("### ARMBAND -> CHIPSEN CLIENT CONNECTED ###");
   }
   void onDisconnect(BLEClient*) override {
-    handConnected = false;   // 재탐색 전이는 handLinkTick()이 감지해서 처리 
+    handConnected = false;   // 재탐색 전이는 handLinkTick()이 감지해서 처리
+    Serial.println("### ARMBAND -> CHIPSEN CLIENT DISCONNECTED ###");
   }
 };
 static HandClientCallbacks handClientCb;
@@ -596,11 +727,14 @@ bool nativeAddrMatchesHandMac(const uint8_t* native) {
 }
 
 // 저장된 MAC과 일치하는 광고만 잡는다.
+static uint32_t handScanSeenCount = 0;   // 이번 스캔에서 (MAC 무관) 관측한 광고 총 개수 — "안 보임"과 "MAC 안 맞음"을 구분하는 용도
+
 class HandScanCallbacks : public BLEAdvertisedDeviceCallbacks {
   // 코어 3.3.11의 시그니처는 **값 전달**이다 (BLEAdvertisedDevice.h:215
   // `virtual void onResult(BLEAdvertisedDevice advertisedDevice) = 0;`).
   // 포인터로 쓰면 override가 안 붙어 클래스가 추상 타입으로 남는다.
   void onResult(BLEAdvertisedDevice dev) override {
+    handScanSeenCount++;
     if (!hasMasterMac) return;
     if (!nativeAddrMatchesHandMac(dev.getAddress().getNative())) return;
     if (pHandFound) delete pHandFound;
@@ -679,8 +813,13 @@ bool buildGestureCmd(int pred, uint8_t out[MARK7_CMD_LEN]) {
 // 의수로 보낸 12바이트를 시리얼에 남긴다. CHIPSEN 모듈을 PC USB에 물려놓고
 // 테스트할 때, 암밴드가 보낸 바이트와 PC 시리얼 툴에 도착한 바이트를 직접
 // 대조할 수 있다(양쪽이 같아야 BLE 구간이 정상).
-void logHandTx(const uint8_t* cmd, const char* tag) {
-  Serial.print("# HAND TX:");
+//
+// ok는 writeValue()의 반환값을 그대로 받는다 — no-response write라 상대가
+// 실제로 받았는지까지는 이 값도 보장 못 하지만(전송 확인 자체가 없는 모드),
+// 최소한 "로컬 BLE 스택이 이 write를 실제로 큐에 넣었는지"는 구분해준다.
+// 이게 없으면 "# HAND TX: ..."가 매번 찍혀서 실패해도 성공한 것처럼 보인다.
+void logHandTx(const uint8_t* cmd, const char* tag, bool ok) {
+  Serial.print(ok ? "# HAND TX:" : "# HAND TX 실패:");
   for (int i = 0; i < MARK7_CMD_LEN; i++) Serial.printf(" %02X", cmd[i]);
   Serial.printf("  (%s)\n", tag);
 }
@@ -847,7 +986,8 @@ void enterSlaveMode() {
   if (handConnected && pHandCmd) {
     uint8_t cmd[MARK7_CMD_LEN];
     buildMark7Reset(cmd);
-    pHandCmd->writeValue(cmd, MARK7_CMD_LEN, false);
+    bool ok = pHandCmd->writeValue(cmd, MARK7_CMD_LEN, false);
+    logHandTx(cmd, "RESET (모드전환)", ok);
   }
 
   forceDisconnectChipsen();   // isConnected=false인데 connId만 남은 반쪽짜리 링크도 확실히 끊는다
@@ -873,9 +1013,34 @@ void enterMasterMode() {
   setStatusLed(16, 8, 0);   // 노랑 = MARK7 탐색 대기 
 }
 
+// HAND_READY인데 STATUS(FFF1) notify가 일정 시간 안 오면 경고한다. CMD는
+// no-response write라 로컬에서 성공 여부를 알 수 없지만, notify는 도착하면
+// 반드시 onHandNotify()가 불리므로 "무선 링크가 실제로 살아있는지" 확인할
+// 유일한 신뢰 가능한 증거다. 안 오는 걸 조용히 넘기면 "링크가 죽음"인지
+// "아직 로그 타이밍이 안 됨"인지 구분이 안 되므로, 침묵 자체를 명시적으로 찍는다.
+void handStatusWatchdog() {
+  if (!pHandStatus) return;   // STATUS characteristic 자체가 없는 기기면 판단 대상이 아님
+
+  static uint32_t warnedAtMs = 0;
+  uint32_t lastActivity = (handRxLastMs > handReadyMs) ? handRxLastMs : handReadyMs;
+  uint32_t silentMs = millis() - lastActivity;
+
+  if (silentMs < HAND_STATUS_TIMEOUT_MS) {
+    warnedAtMs = 0;   // 정상 수신 중 — 다음 침묵 구간에 다시 경고할 수 있게 리셋
+    return;
+  }
+
+  if (warnedAtMs != 0 && millis() - warnedAtMs < HAND_STATUS_TIMEOUT_MS) return;  // 같은 침묵 구간 스팸 방지
+  warnedAtMs = millis();
+
+  Serial.printf("# HAND: STATUS(FFF1) %lums째 무응답 — 링크는 연결 상태지만 무선 구간 또는 "
+                "칩센 쪽 브릿지에서 끊겼을 수 있음 (칩센 자체 시리얼에 CMD 원문이 보이는지 대조)\n",
+                (unsigned long)silentMs);
+}
+
 // MASTER 모드에서만 호출 (스캔 → connect → service discovery)
 void handLinkTick() {
-  // READY였는데 링크가 끊긴 경우 → 재탐색으로 
+  // READY였는데 링크가 끊긴 경우 → 재탐색으로
   if (handState == HAND_READY && !handConnected) {
     Serial.println("# HAND: 링크 끊김 — 재탐색");
     pHandCmd    = nullptr;
@@ -886,13 +1051,17 @@ void handLinkTick() {
     backoffHand();
   }
 
-  if (handState == HAND_READY) return;
+  if (handState == HAND_READY) {
+    handStatusWatchdog();
+    return;
+  }
   if (!hasMasterMac) return;              // 페어링 안 됐으면 아무것도 안함 
   if (millis() < handNextTryMs) return;
 
   switch (handState) {
     case HAND_IDLE: {
       if (pHandFound) { delete pHandFound; pHandFound = nullptr; }
+      handScanSeenCount = 0;
 
       BLEDevice::stopAdvertising();    // 스캔 동안 라디오 경합 제거
 
@@ -907,9 +1076,20 @@ void handLinkTick() {
       if (deviceConnected) return;
 
       if (pHandFound) {
-        handState = HAND_CONNECTING;    // connect 까지는 광고를 끈 채로 진행 
+        handState = HAND_CONNECTING;    // connect 까지는 광고를 끈 채로 진행
       } else {
-        Serial.println("# HAND: MARK7 못 찾음");
+        // "광고 자체를 하나도 못 봄"과 "광고는 봤는데 MAC이 안 맞음"은 원인이
+        // 완전히 다르다 — 전자는 스캔/거리/전원 문제, 후자는 MARK7_MAC_FORCED가
+        // 틀렸다는 뜻이다. 이 둘을 구분 못 하면 "못 찾음" 한 줄로는 진단이 안 된다.
+        if (handScanSeenCount == 0) {
+          Serial.printf("# HAND: MARK7(%02X:%02X:%02X:%02X:%02X:%02X) 못 찾음 — 이번 스캔(%ds)에서 광고 자체를 하나도 못 봄 (칩센 전원/거리 확인)\n",
+                        masterMac[0], masterMac[1], masterMac[2], masterMac[3], masterMac[4], masterMac[5],
+                        SCAN_SECONDS);
+        } else {
+          Serial.printf("# HAND: MARK7(%02X:%02X:%02X:%02X:%02X:%02X) 못 찾음 — 광고 %lu건 봤지만 이 MAC과 일치하는 건 없음 (MARK7_MAC_FORCED 확인)\n",
+                        masterMac[0], masterMac[1], masterMac[2], masterMac[3], masterMac[4], masterMac[5],
+                        (unsigned long)handScanSeenCount);
+        }
         BLEDevice::startAdvertising();    // backoff 동안은 폰이 들어올 수 있게
         backoffHand();
       }
@@ -922,10 +1102,72 @@ void handLinkTick() {
         pHandClient->setClientCallbacks(&handClientCb);
       }
 
+      Serial.println("##################################################");
+      Serial.println("### CHIPSEN CONNECT DEBUG START");
+      Serial.println("##################################################");
+
+#if defined(CONFIG_NIMBLE_ENABLED)
+      // connect()를 부르기 전에, 저수준 NimBLE이 이 주소로 이미 링크를 들고
+      // 있진 않은지 먼저 확인한다 — 그렇다면 이번 FAIL이 "새 연결 실패"가
+      // 아니라 "이전 반쪽짜리 링크가 안 정리된 채 남아있어서"일 수 있다.
+      ble_addr_t targetAddr;
+      targetAddr.type = pHandFound->getAddressType();
+      memcpy(targetAddr.val, pHandFound->getAddress().getNative(), 6);
+
+      struct ble_gap_conn_desc existingDesc;
+      int existingRc = ble_gap_conn_find_by_addr(&targetAddr, &existingDesc);
+
+      Serial.printf(
+        "### PRECHECK: existing connection rc=%d (%s) ###\n",
+        existingRc,
+        BLEUtils::returnCodeToString(existingRc)
+      );
+
+      if (existingRc == 0) {
+        Serial.printf(
+          "### PRECHECK: 이미 링크 존재! handle=%u ###\n",
+          existingDesc.conn_handle
+        );
+        dumpConnDesc(existingDesc.conn_handle, "BEFORE connect()");
+      }
+#endif
+
+      uint32_t connectStartMs = millis();
+      Serial.printf("### [%lu ms] pHandClient->connect() CALL ###\n", (unsigned long)connectStartMs);
+
       bool ok = pHandClient->connect(pHandFound);   // 블로킹
 
+      uint32_t connectEndMs = millis();
+      uint16_t connId = pHandClient->getConnId();
+
+      Serial.printf(
+        "### [%lu ms] pHandClient->connect() RETURN elapsed=%lu ms ###\n",
+        (unsigned long)connectEndMs, (unsigned long)(connectEndMs - connectStartMs)
+      );
+
+      Serial.printf(
+        "### RESULT: ok=%d isConnected=%d handConnected=%d connId=%u ###\n",
+        ok, pHandClient->isConnected(), handConnected, (unsigned)connId
+      );
+
+#if defined(CONFIG_NIMBLE_ENABLED)
+      // BLEClient 래퍼는 FAIL이라고 해도, 저수준 NimBLE에 실제 연결이
+      // 존재하는지는 별개로 확인한다.
+      if (connId != BLE_HS_CONN_HANDLE_NONE) {
+        dumpConnDesc(connId, "AFTER connect() RETURN");
+      } else {
+        Serial.println("### AFTER connect(): connId 자체가 없음 ###");
+      }
+#endif
+
+      Serial.println("##################################################");
+      Serial.println("### CHIPSEN CONNECT DEBUG END");
+      Serial.println("##################################################");
+      Serial.println();
+
       if (deviceConnected) {
-        forceDisconnectChipsen();   // isConnected=false인데 connId만 남은 반쪽짜리 링크도 확실히 끊는다
+        Serial.println("# PHONE 연결됨 → CHIPSEN 링크 강제 종료");
+        forceDisconnectChipsen();
         handState = HAND_IDLE;
         return;
       }
@@ -938,6 +1180,7 @@ void handLinkTick() {
         if (resolveHandChars()) {
           handState = HAND_READY;
           handRetryMs = HAND_RETRY_MS_MIN;
+          handReadyMs = millis();           // STATUS 무응답 워치독 기준점 리셋
           BLEDevice::startAdvertising();    // 연결 성공(광고 다시 켜서 폰 진입로 유지)
           setStatusLed(0, 16, 0);           // 초록 = MASTER 동작 중
           Serial.println("# HAND: ready - MASTER 모드 동작");
@@ -946,7 +1189,33 @@ void handLinkTick() {
         Serial.println("# HAND: 후보 UUID 중 맞는 것 없음 — 위 GATT 덤프 참고");
         pHandClient->disconnect();
       } else {
-        Serial.println("# HAND: connect 실패");
+        uint16_t connId = pHandClient->getConnId();
+
+        Serial.printf(
+          "# HAND: connect 실패 / isConnected=%d / connId=%u\n",
+          pHandClient->isConnected(),
+          (unsigned)connId
+        );
+
+        // connect()는 실패했지만 connection handle이 남아있는 경우 —
+        // CHIPSEN 쪽엔 링크가 이미 맺어졌을 수 있으므로(CONNECTED 상태로
+        // 남아 advertising을 재개 안 함) 여기서 바로 delete하지 않고 먼저
+        // 명시적으로 끊어서 정리한다. Client 객체를 살려두는 이유는 NimBLE
+        // 쪽에서 disconnect 이벤트가 끝나기 전에 Client가 사라지면 안 되고,
+        // connection handle이 남은 채로 다음 connect()를 시도하면 그 자체가
+        // busy/already-connected로 거부될 수 있기 때문.
+        if (connId != 0xFFFF) {
+          Serial.println("# CHIPSEN: 잔여 BLE 링크 정리 시도");
+
+          int rc = pHandClient->disconnect();
+
+          Serial.printf("# CHIPSEN: cleanup disconnect rc=%d\n", rc);
+
+          delay(1000);   // CHIPSEN이 DISCONNECTED 처리하고 다시 advertising 시작할 시간
+        }
+
+        // 여기서는 delete하지 않는다 — 같은 Client를 재사용 (HAND_CONNECTING
+        // 진입부의 `if (!pHandClient)`는 이미 있으면 새로 안 만듦).
       }
       BLEDevice::startAdvertising();   // 실패 경로 - 반드시 다시 켬
       handState = HAND_IDLE;
@@ -971,8 +1240,8 @@ void handTestSweep() {
 
   uint8_t cmd[MARK7_CMD_LEN];
   buildGestureCmd(grasp ? 3 : 0, cmd);   // 3=close, 0=rest
-  pHandCmd->writeValue(cmd, MARK7_CMD_LEN, false);
-  logHandTx(cmd, grasp ? "SWEEP close" : "SWEEP rest");
+  bool ok = pHandCmd->writeValue(cmd, MARK7_CMD_LEN, false);
+  logHandTx(cmd, grasp ? "SWEEP close" : "SWEEP rest", ok);
   grasp = !grasp;
 }
 #endif
@@ -1016,7 +1285,11 @@ void setup() {
 
   Wire.begin(SDA_PIN, SCL_PIN);
 
+  Serial.println("# SETUP: BNO055 init 시작 (bno.begin() 대기 — 여기서 안 넘어가면 센서 배선/전원 확인)");
+  uint32_t bnoRetries = 0;
   while (!bno.begin()) {
+    bnoRetries++;
+    Serial.printf("# SETUP: bno.begin() 실패, 재시도 중 (%lu회째)\n", (unsigned long)bnoRetries);
     for (int i = 0; i < 15; ++i) {
       for (int j = 0; j < 4; ++j) {
         strip.setPixelColor(j, i * 4, 0, i * 4);
@@ -1025,6 +1298,7 @@ void setup() {
       delay(10);
     }
   }
+  Serial.printf("# SETUP: BNO055 init 완료 (재시도 %lu회)\n", (unsigned long)bnoRetries);
 
   for (int i = 0; i < 10; ++i) {
     for (int j = 0; j < 4; ++j) {
@@ -1048,6 +1322,11 @@ void setup() {
   calib = 1;
 
   BLEDevice::init("ESP32S3_FAST_BLE");
+
+#if defined(CONFIG_NIMBLE_ENABLED)
+  BLEDevice::setCustomGapHandler(bleGapDebug);
+#endif
+
   BLEDevice::setMTU(247);
 
   BLEServer* pServer = BLEDevice::createServer();
@@ -1282,12 +1561,25 @@ void runInference() {
       if (buildGestureCmd(final_pred, cmd)) {
         // 20Hz 경로이므로 no-response. with-response는 connection interval만큼
         // 블로킹해서 781µs 샘플링 루프를 깨뜨린다.
-        pHandCmd->writeValue(cmd, MARK7_CMD_LEN, false);
-        logHandTx(cmd, CLASS_NAMES[final_pred]);
+        bool ok = pHandCmd->writeValue(cmd, MARK7_CMD_LEN, false);
+        logHandTx(cmd, CLASS_NAMES[final_pred], ok);
+      } else if (final_pred != lastSentPred) {
+        // 이 제스처는 아직 매핑이 없다 — "왜 안 보내지?"를 조용히 넘기지 않고
+        // 남긴다. final_pred가 바뀔 때만(keepalive 틱마다는 X) 찍어서 스팸 방지.
+        Serial.printf("# HAND: %s는 매핑 없음 — 전송 안 함\n", CLASS_NAMES[final_pred]);
       }
       lastSentPred = final_pred;
       lastSendMs = millis();
     }
+  } else if (mode == MODE_MASTER) {
+    // MASTER 모드이긴 한데 아직 MARK7에 연결되지 않은 상태 — 추론은 계속
+    // 돌지만 보낼 곳이 없다. 20Hz마다 찍으면 스팸이라 상태가 바뀔 때만 남김.
+    static bool warned = false;
+    if (!warned) {
+      Serial.println("# HAND: MASTER 모드지만 아직 HAND_READY 아님 — 추론 결과 전송 안 됨");
+      warned = true;
+    }
+    if (handState == HAND_READY) warned = false;  // 다음에 다시 끊기면 재경고
   }
 
   // Aggregate stats
