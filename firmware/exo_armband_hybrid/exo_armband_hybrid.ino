@@ -201,46 +201,68 @@ Preferences pairPrefs;
 uint8_t masterMac[6] = {0};
 bool hasMasterMac = false;
 
-// ESP32에 저장된 로봇 의수 MAC을 불러오고, 저장 여부를 확인하는 함수 
+// ── MAC fallback 관리 ──────────────────────────────────────────────
+// NVS에 저장된 MAC을 우선 사용하되, 연속 스캔 실패가 임계치를 넘으면
+// 벤치 테스트용 하드코딩 MAC(MARK7_MAC_FORCED)으로 전환한다.
+// loadMasterMac()이 이 밑의 switchToFallbackMac()/변수들을 바로 쓰기 때문에,
+// handScanSeenCount 근처(파일 뒤쪽)가 아니라 반드시 loadMasterMac()보다
+// 앞에 선언해야 한다 — 안 그러면 "not declared in this scope"로 컴파일 실패.
+#if MARK7_MAC_OVERRIDE
+#define MARK7_SCAN_FAIL_THRESHOLD 3
+static uint32_t handScanFailCount = 0;
+static bool     usingFallbackMac = false;
+
+// 하드코딩된 벤치 테스트용 MAC으로 전환한다.
+// - NVS가 비어있을 때: loadMasterMac()에서 즉시 호출
+// - NVS 값으로 연속 스캔 실패가 임계치를 넘었을 때: handLinkTick()에서 호출
+void switchToFallbackMac() {
+  memcpy(masterMac, MARK7_MAC_FORCED, sizeof(masterMac));
+  hasMasterMac = true;
+  usingFallbackMac = true;
+  handScanFailCount = 0;
+  Serial.printf(
+    "# PAIR: [FALLBACK] 하드코딩 MAC으로 전환 %02X:%02X:%02X:%02X:%02X:%02X\n",
+    masterMac[0], masterMac[1], masterMac[2],
+    masterMac[3], masterMac[4], masterMac[5]
+  );
+}
+#endif
+
+// ESP32에 저장된 로봇 의수 MAC을 불러오고, 저장 여부를 확인하는 함수
 void loadMasterMac() {
   pairPrefs.begin("pairing", true);
 
   size_t n = pairPrefs.getBytes(
-    "master_mac", 
-    masterMac, 
+    "master_mac",
+    masterMac,
     sizeof(masterMac)
   );
 
   pairPrefs.end();
 
   hasMasterMac = (n == sizeof(masterMac));
+#if MARK7_MAC_OVERRIDE
+  usingFallbackMac = false;
+  handScanFailCount = 0;
+#endif
 
   if (hasMasterMac) {
     Serial.printf(
-      "# PAIR: 저장된 마스터 %02X:%02X:%02X:%02X:%02X:%02X\n", 
-      masterMac[0], 
-      masterMac[1], 
-      masterMac[2], 
-      masterMac[3], 
-      masterMac[4], 
+      "# PAIR: 저장된 마스터(NVS) %02X:%02X:%02X:%02X:%02X:%02X\n",
+      masterMac[0],
+      masterMac[1],
+      masterMac[2],
+      masterMac[3],
+      masterMac[4],
       masterMac[5]
     );
   } else {
     Serial.println("# PAIR: 저장된 마스터 없음");
-  }
-
 #if MARK7_MAC_OVERRIDE
-  // NVS 값을 덮어쓴다. 이 한 곳만 바꾸면 아래가 모두 따라온다 —
-  // handLinkTick()의 hasMasterMac 게이트, HandScanCallbacks의 MAC 비교,
-  // characteristic ...459의 READ 응답까지.
-  memcpy(masterMac, MARK7_MAC_FORCED, sizeof(masterMac));
-  hasMasterMac = true;
-  Serial.printf(
-    "# PAIR: [OVERRIDE] NVS 무시하고 강제 MAC 사용 %02X:%02X:%02X:%02X:%02X:%02X\n",
-    masterMac[0], masterMac[1], masterMac[2],
-    masterMac[3], masterMac[4], masterMac[5]
-  );
+    // NVS 자체가 비어있으면 처음부터 하드코딩 MAC으로 시작
+    switchToFallbackMac();
 #endif
+  }
 }
 
 // PC에게 Pairing 결과를 보내는 함수
@@ -1090,6 +1112,21 @@ void handLinkTick() {
                         masterMac[0], masterMac[1], masterMac[2], masterMac[3], masterMac[4], masterMac[5],
                         (unsigned long)handScanSeenCount);
         }
+
+#if MARK7_MAC_OVERRIDE
+        // NVS 주소로 스캔 중이었고, 연속 실패가 임계치를 넘으면 하드코딩 MAC으로 전환.
+        // fallback 주소 자체가 실패하는 건 여기서 안 건드림 (하드웨어 전원/거리
+        // 문제일 가능성이 높아 무한 전환 루프를 막기 위함).
+        if (!usingFallbackMac) {
+          handScanFailCount++;
+          Serial.printf("# PAIR: NVS 주소 스캔 실패 %lu/%d회\n",
+                        (unsigned long)handScanFailCount, MARK7_SCAN_FAIL_THRESHOLD);
+          if (handScanFailCount >= MARK7_SCAN_FAIL_THRESHOLD) {
+            switchToFallbackMac();
+          }
+        }
+#endif
+
         BLEDevice::startAdvertising();    // backoff 동안은 폰이 들어올 수 있게
         backoffHand();
       }
@@ -1180,6 +1217,9 @@ void handLinkTick() {
         if (resolveHandChars()) {
           handState = HAND_READY;
           handRetryMs = HAND_RETRY_MS_MIN;
+#if MARK7_MAC_OVERRIDE
+          handScanFailCount = 0;            // 연결 성공했으니 실패 카운터 리셋
+#endif
           handReadyMs = millis();           // STATUS 무응답 워치독 기준점 리셋
           BLEDevice::startAdvertising();    // 연결 성공(광고 다시 켜서 폰 진입로 유지)
           setStatusLed(0, 16, 0);           // 초록 = MASTER 동작 중
