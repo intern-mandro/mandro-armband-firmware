@@ -40,6 +40,20 @@ arduino-cli lib install "Adafruit BNO055"
 
 설치에 수 분 걸린다. `directories.*`를 영문 경로로 지정하는 이유는 아래 참고.
 
+### 1-1. NimBLE BLEClient 패치 (필수, 코어 새로 설치할 때마다)
+
+```powershell
+powershell -File patches\apply-bleclient-patch.ps1
+```
+
+방금 설치한 esp32 코어의 `BLEClient.cpp`는 스톡 상태라 MASTER 모드에서 로봇 의수에
+BLE 클라이언트로 접속할 때 조용히 실패하는 문제가 있다 (NimBLE이 연결 직후 MTU
+교환을 자체적으로 먼저 끝내버리면 `BLE_HS_EALREADY`가 반환되는데, 스톡 코드는
+이걸 다른 에러와 똑같이 취급해 정상 연결도 실패로 처리한다). 이 스크립트가 코어
+설치 경로를 자동으로 찾아 `patches/BLEClient.ealready-mtu.patch`를 적용한다.
+이미 적용돼 있으면 아무것도 안 하고 넘어간다 — 자세한 내용은
+[`patches/BLEClient.ealready-mtu.patch`](patches/BLEClient.ealready-mtu.patch) 상단 주석 참고.
+
 ### 2. 컴파일
 
 ```powershell
@@ -121,6 +135,15 @@ Remove-Item -Recurse -Force "$env:USERPROFILE\Documents\Arduino\libraries"
   삭제하면 IDE 쪽 코어·라이브러리를 다시 받아야 한다.
 
 컴파일 시 `--build-path`를 주는 것도 같은 이유다. 둘 다 필요하다.
+
+### MASTER 모드에서 로봇 의수 연결이 계속 실패하는 경우
+
+시리얼 모니터에 `MTU exchange error` 로그가 찍히면서 의수(칩센)에 연결이 안 되면
+1-1단계의 BLEClient 패치가 안 적용된 것이다. 코어를 새로 설치했거나(`arduino-cli
+core install esp32:esp32`을 다시 돌렸거나) 다른 PC에서 처음 세팅하는 경우 흔히
+빠뜨린다. `powershell -File patches\apply-bleclient-patch.ps1`을 실행하고
+(컴파일이 아니라 코어 파일 자체를 고치는 것이므로 재컴파일은 필요 없다) 다시
+시도한다.
 
 ### `fatal error: Adafruit_NeoPixel.h: No such file or directory`
 

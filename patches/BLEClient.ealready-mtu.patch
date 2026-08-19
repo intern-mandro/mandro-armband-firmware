@@ -1,0 +1,41 @@
+# NimBLE BLEClient.cpp — MTU 교환 BLE_HS_EALREADY 오탐 수정
+#
+# 대상: <arduino-cli data dir>/packages/esp32/hardware/esp32/3.3.11/libraries/BLE/src/BLEClient.cpp
+# (기본 Arduino ESP32 코어 라이브러리 — 이 저장소 밖, 시스템에 전역 설치된 파일이라
+#  git으로 추적되지 않는다. 코어를 새로 설치할 때마다 이 패치를 다시 적용해야 한다.)
+#
+# 증상: 암밴드가 MASTER 모드로 로봇 의수(칩센 모듈)에 BLE 클라이언트로 연결을 시도할
+# 때, NimBLE 코어가 연결 직후 MTU 교환을 자체적으로 먼저 끝내버리는 경우가 있다.
+# 그 상태에서 BLEClient::connect()가 명시적으로 다시 ble_gattc_exchange_mtu()를
+# 호출하면 "이미 완료됨"을 뜻하는 BLE_HS_EALREADY가 돌아오는데, 패치 전 코드는 이걸
+# rc != 0인 모든 경우와 동일하게 취급해서 정상 연결을 실패로 처리해버렸다.
+#
+# 이 diff는 참고/리뷰용이다 — 실제 적용은 patches/apply-bleclient-patch.ps1이
+# patches/BLEClient.cpp(패치 완료본)를 그대로 덮어쓰는 방식으로 하며, 이 파일을
+# git apply로 재구성하지 않는다 (대상 PC의 스톡 파일이 줄바꿈 방식이나 코어
+# 마이너 버전 차이로 조금만 달라도 git apply는 컨텍스트 불일치로 실패할 수 있음).
+#
+# 원본(패치 전) 사본: patches/BLEClient.cpp.orig — 되돌리는 방법은 patches/README.md 참고.
+#
+--- a/BLEClient.cpp
++++ b/BLEClient.cpp
+@@ -1169,11 +1169,18 @@
+         client->m_conn_id = event->connect.conn_handle;
+ 
+         rc = ble_gattc_exchange_mtu(client->m_conn_id, nullptr, nullptr);
+-        if (rc != 0) {
++        if (rc != 0 && rc != BLE_HS_EALREADY) {
+           log_e("BLEClient", "MTU exchange error; rc=%d %s", rc, BLEUtils::returnCodeToString(rc));
+           break;
+         }
+ 
++        if (rc == BLE_HS_EALREADY) {
++          // MTU 교환이 이미 완료된 상태 (NimBLE 코어가 자동으로 먼저 처리함)
++          log_i("BLEClient", "MTU already exchanged(EALREADY) - treating as connected");
++          rc = 0;
++          break;
++        }
++
+         if (BLESecurity::m_securityEnabled && BLESecurity::m_forceSecurity) {
+           BLESecurity::startSecurity(client->m_conn_id);
+         }
