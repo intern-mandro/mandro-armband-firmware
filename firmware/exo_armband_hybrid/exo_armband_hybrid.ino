@@ -999,12 +999,7 @@ bool resolveHandChars() {
 void enterSlaveMode() {
   Serial.println("# MODE: MASTER -> SLAVE (폰 연결)");
 
-  // 의수가 마지막 제스처를 잡은 채로 두지 않기 위해 정지 명령을 먼저 보냄.
-  // 원래 with-response(true)로 보내서 전달을 확인한 뒤 끊으려 했는데, 이
-  // CHIPSEN류 모듈에서 with-response가 정상 응답하는지 검증된 적이 없다.
-  // 응답이 안 오면 이 호출이 블로킹돼서 밑의 disconnect()가 영영 실행이 안
-  // 되고(= MARK7 쪽에 +DISCONNECTED가 안 뜨는 증상과 일치), loop() 전체가
-  // 멈춘다. 20Hz 경로에서 이미 검증된 no-response로 통일해 그 위험을 없앤다.
+  // 의수가 마지막 제스처 자세로 굳어있지 않도록 정지 명령 먼저 전송 
   if (handConnected && pHandCmd) {
     uint8_t cmd[MARK7_CMD_LEN];
     buildMark7Reset(cmd);
@@ -1012,49 +1007,51 @@ void enterSlaveMode() {
     logHandTx(cmd, "RESET (모드전환)", ok);
   }
 
-  forceDisconnectChipsen();   // isConnected=false인데 connId만 남은 반쪽짜리 링크도 확실히 끊는다
+  forceDisconnectChipsen();   // 반쪽짜리(연결 끊겼는데 connId만 남은) 링크까지 확실히 정리
 
+  // 로봇손 관련 상태 초기화
   handConnected = false;
   pHandCmd    = nullptr;
   pHandStatus = nullptr;
-  handRxLen   = 0;          // 재조립 버퍼 비우기 (조각이 남으면 다음 연결의 첫 프레임이 어긋난다)
+  handRxLen   = 0;          // 수신 버퍼 초기화 (다음 연결 프레임 밀림 방지)
   handState = HAND_IDLE;
   handRetryMs = HAND_RETRY_MS_MIN;
   if (pHandFound) { delete pHandFound; pHandFound = nullptr; }
 
-  // 폰이 이미 연결된 상태라 컨트롤러가 광고를 꺼둔게 정상 
+  // 폰 연결 중이라 광고는 꺼진 상태가 정상 
   setStatusLed(0, 0, 16);   // 파랑 = SLAVE
 }
 
 // SLAVE → MASTER 모드 전환 (폰이 끊긴 경우 MARK7 탐색 시작)
 void enterMasterMode() {
   Serial.println("# MODE: SLAVE -> MASTER (폰 끊김)"); 
-  handState = HAND_IDLE;
-  handRetryMs = HAND_RETRY_MS_MIN;
+  
+  handState = HAND_IDLE;                      // 로봇손 연결 상태 머신을 '대기' 상태로 리셋
+  handRetryMs = HAND_RETRY_MS_MIN;            // 재시도 간격을 최소값으로 초기화 (다음 실패 시부터 백오프 다시 시작)
+  
   handNextTryMs = millis() + MASTER_ENTRY_DELAY_MS;
-  setStatusLed(16, 8, 0);   // 노랑 = MARK7 탐색 대기 
+  // 지금 당장 스캔 시작 x, MASTER_ENTRY_DELAY_MS(ms)만큼 지난 뒤에야 첫 탐색 시도 허용 
+
+  setStatusLed(16, 8, 0);   // 노랑 = MARK7 탐색 대기 (아직 스캔 시작 전)
 }
 
-// HAND_READY인데 STATUS(FFF1) notify가 일정 시간 안 오면 경고한다. CMD는
-// no-response write라 로컬에서 성공 여부를 알 수 없지만, notify는 도착하면
-// 반드시 onHandNotify()가 불리므로 "무선 링크가 실제로 살아있는지" 확인할
-// 유일한 신뢰 가능한 증거다. 안 오는 걸 조용히 넘기면 "링크가 죽음"인지
-// "아직 로그 타이밍이 안 됨"인지 구분이 안 되므로, 침묵 자체를 명시적으로 찍는다.
+// HAND_READY인데 STATUS characteristic가 없을 경우 리턴 
 void handStatusWatchdog() {
-  if (!pHandStatus) return;   // STATUS characteristic 자체가 없는 기기면 판단 대상이 아님
+  if (!pHandStatus) return;   // STATUS characteristic 없는 기기면 체크 대상 아님 
 
   static uint32_t warnedAtMs = 0;
   uint32_t lastActivity = (handRxLastMs > handReadyMs) ? handRxLastMs : handReadyMs;
-  uint32_t silentMs = millis() - lastActivity;
+  uint32_t silentMs = millis() - lastActivity;    // 침묵 지속 시간 
 
   if (silentMs < HAND_STATUS_TIMEOUT_MS) {
-    warnedAtMs = 0;   // 정상 수신 중 — 다음 침묵 구간에 다시 경고할 수 있게 리셋
+    warnedAtMs = 0;   // 정상 수신 중 → 경고 상태 리셋
     return;
   }
 
-  if (warnedAtMs != 0 && millis() - warnedAtMs < HAND_STATUS_TIMEOUT_MS) return;  // 같은 침묵 구간 스팸 방지
+  if (warnedAtMs != 0 && millis() - warnedAtMs < HAND_STATUS_TIMEOUT_MS) return;  // 같은 침묵 구간 중복 경고 방지 
   warnedAtMs = millis();
 
+  // 무응답 경고 출력 
   Serial.printf("# HAND: STATUS(FFF1) %lums째 무응답 — 링크는 연결 상태지만 무선 구간 또는 "
                 "칩센 쪽 브릿지에서 끊겼을 수 있음 (칩센 자체 시리얼에 CMD 원문이 보이는지 대조)\n",
                 (unsigned long)silentMs);
@@ -1062,31 +1059,35 @@ void handStatusWatchdog() {
 
 // MASTER 모드에서만 호출 (스캔 → connect → service discovery)
 void handLinkTick() {
-  // READY였는데 링크가 끊긴 경우 → 재탐색으로
+  // READY 상태였는데 실제 연결이 끊긴 경우 → 재탐색으로 상태 되돌림 
   if (handState == HAND_READY && !handConnected) {
     Serial.println("# HAND: 링크 끊김 — 재탐색");
     pHandCmd    = nullptr;
     pHandStatus = nullptr;
-    handRxLen = 0;            // 재조립 버퍼 초기화 — 다음 연결이 깨끗하게 시작되게
+    handRxLen = 0;            // 수신 버퍼 초기화 
     handState = HAND_IDLE;
     setStatusLed(16, 8, 0);
-    backoffHand();
+    backoffHand();            // 재시도 간격(백오프) 적용 
   }
 
+  // 이미 연결된 상태면 워치독만 체크하고 리턴 
   if (handState == HAND_READY) {
     handStatusWatchdog();
     return;
   }
-  if (!hasMasterMac) return;              // 페어링 안 됐으면 아무것도 안함 
-  if (millis() < handNextTryMs) return;
+  if (!hasMasterMac) return;              // 로봇손 MAC 페어링 안 됐으면 아무것도 안함 
+  if (millis() < handNextTryMs) return;   // 재시도 대기시간 안지났으면 스킵 
 
   switch (handState) {
+
+    // 1. 스캔 단계
     case HAND_IDLE: {
       if (pHandFound) { delete pHandFound; pHandFound = nullptr; }
       handScanSeenCount = 0;
 
-      BLEDevice::stopAdvertising();    // 스캔 동안 라디오 경합 제거
+      BLEDevice::stopAdvertising();    // 스캔 중엔 Advertising 꺼서 라디오 경합 방지
 
+      // 실제 BLE 스캔 실행 (SCAN_SECONDS 동안, 발견 시 handScanCb 콜백 호출)
       BLEScan* s = BLEDevice::getScan();
       s->setAdvertisedDeviceCallbacks(&handScanCb, false);
       s->setActiveScan(true);
@@ -1094,15 +1095,14 @@ void handLinkTick() {
       s->stop();
       s->clearResults();
 
-      // 스캔 중에 폰이 붙는 경우 → 다음 modeTick()이 SLAVE로 보낸다
+      // 스캔 도중 폰이 연결되면 → 다음 modeTick()에서 SLAVE로 전환될 것이므로 여기선 중단 
       if (deviceConnected) return;
 
       if (pHandFound) {
-        handState = HAND_CONNECTING;    // connect 까지는 광고를 끈 채로 진행
+        handState = HAND_CONNECTING;    // 로봇손 발견 → 연결 시도 단계로 
       } else {
-        // "광고 자체를 하나도 못 봄"과 "광고는 봤는데 MAC이 안 맞음"은 원인이
-        // 완전히 다르다 — 전자는 스캔/거리/전원 문제, 후자는 MARK7_MAC_FORCED가
-        // 틀렸다는 뜻이다. 이 둘을 구분 못 하면 "못 찾음" 한 줄로는 진단이 안 된다.
+
+        // 못 찾은 이유 구분: 광고 자체를 못 봄 vs MAC 안 맞음 → 원인 진단용 로그
         if (handScanSeenCount == 0) {
           Serial.printf("# HAND: MARK7(%02X:%02X:%02X:%02X:%02X:%02X) 못 찾음 — 이번 스캔(%ds)에서 광고 자체를 하나도 못 봄 (칩센 전원/거리 확인)\n",
                         masterMac[0], masterMac[1], masterMac[2], masterMac[3], masterMac[4], masterMac[5],
@@ -1114,9 +1114,7 @@ void handLinkTick() {
         }
 
 #if MARK7_MAC_OVERRIDE
-        // NVS 주소로 스캔 중이었고, 연속 실패가 임계치를 넘으면 하드코딩 MAC으로 전환.
-        // fallback 주소 자체가 실패하는 건 여기서 안 건드림 (하드웨어 전원/거리
-        // 문제일 가능성이 높아 무한 전환 루프를 막기 위함).
+        // NVS 저장 MAC으로 계속 실패하면 일정 횟수 후 하드코딩 fallback MAC으로 전환 
         if (!usingFallbackMac) {
           handScanFailCount++;
           Serial.printf("# PAIR: NVS 주소 스캔 실패 %lu/%d회\n",
@@ -1127,15 +1125,16 @@ void handLinkTick() {
         }
 #endif
 
-        BLEDevice::startAdvertising();    // backoff 동안은 폰이 들어올 수 있게
+        BLEDevice::startAdvertising();    // 재시도 대기 중엔 폰이 연결할 수 있게 광고 재개
         backoffHand();
       }
       break;
     }
 
+    // 2. 연결 시도 단계 
     case HAND_CONNECTING: {
       if (!pHandClient) {
-        pHandClient = BLEDevice::createClient();
+        pHandClient = BLEDevice::createClient();    // 암밴드가 로봇손에 대해 GATT Client 역할 생성 
         pHandClient->setClientCallbacks(&handClientCb);
       }
 
@@ -1144,9 +1143,6 @@ void handLinkTick() {
       Serial.println("##################################################");
 
 #if defined(CONFIG_NIMBLE_ENABLED)
-      // connect()를 부르기 전에, 저수준 NimBLE이 이 주소로 이미 링크를 들고
-      // 있진 않은지 먼저 확인한다 — 그렇다면 이번 FAIL이 "새 연결 실패"가
-      // 아니라 "이전 반쪽짜리 링크가 안 정리된 채 남아있어서"일 수 있다.
       ble_addr_t targetAddr;
       targetAddr.type = pHandFound->getAddressType();
       memcpy(targetAddr.val, pHandFound->getAddress().getNative(), 6);
@@ -1172,7 +1168,7 @@ void handLinkTick() {
       uint32_t connectStartMs = millis();
       Serial.printf("### [%lu ms] pHandClient->connect() CALL ###\n", (unsigned long)connectStartMs);
 
-      bool ok = pHandClient->connect(pHandFound);   // 블로킹
+      bool ok = pHandClient->connect(pHandFound);   // 실제 연결 시도 (블로킹)
 
       uint32_t connectEndMs = millis();
       uint16_t connId = pHandClient->getConnId();
@@ -1188,8 +1184,7 @@ void handLinkTick() {
       );
 
 #if defined(CONFIG_NIMBLE_ENABLED)
-      // BLEClient 래퍼는 FAIL이라고 해도, 저수준 NimBLE에 실제 연결이
-      // 존재하는지는 별개로 확인한다.
+
       if (connId != BLE_HS_CONN_HANDLE_NONE) {
         dumpConnDesc(connId, "AFTER connect() RETURN");
       } else {
@@ -1202,6 +1197,7 @@ void handLinkTick() {
       Serial.println("##################################################");
       Serial.println();
 
+      // 연결 시도 중 폰이 붙어버리면 → 로봇손 링크는 강제 종료하고 IDLE로 
       if (deviceConnected) {
         Serial.println("# PHONE 연결됨 → CHIPSEN 링크 강제 종료");
         forceDisconnectChipsen();
@@ -1210,25 +1206,26 @@ void handLinkTick() {
       }
 
       if (ok) {
-        // 실물 GATT 구조를 항상 남긴다 — 박아둔 FFF0/FFF1/FFF2가 맞는지
-        // 첫 연결 로그에서 바로 확인된다.
-        dumpHandGatt();
+        dumpHandGatt();   // 연결 성공 시 GATT 구조 로그로 남김 (디버깅용)
 
-        if (resolveHandChars()) {
+        if (resolveHandChars()) {      // 필요한 characteristic(FFF0/1/2 등) 찾기 성공하면 
           handState = HAND_READY;
           handRetryMs = HAND_RETRY_MS_MIN;
 #if MARK7_MAC_OVERRIDE
           handScanFailCount = 0;            // 연결 성공했으니 실패 카운터 리셋
 #endif
           handReadyMs = millis();           // STATUS 무응답 워치독 기준점 리셋
-          BLEDevice::startAdvertising();    // 연결 성공(광고 다시 켜서 폰 진입로 유지)
-          setStatusLed(0, 16, 0);           // 초록 = MASTER 동작 중
+          BLEDevice::startAdvertising();    // 폰 연결 경로도 계속 열어둠 
+          setStatusLed(0, 16, 0);           // 초록 = MASTER 정상 동작 중
           Serial.println("# HAND: ready - MASTER 모드 동작");
           break;
         }
+        
+        // characteristic을 못 찾으면 연결 무의미 → 끊기 
         Serial.println("# HAND: 후보 UUID 중 맞는 것 없음 — 위 GATT 덤프 참고");
         pHandClient->disconnect();
       } else {
+        // 연결 실패 처리: 반쪽짜리 링크 남아있으면 명시적으로 정리 
         uint16_t connId = pHandClient->getConnId();
 
         Serial.printf(
@@ -1237,13 +1234,6 @@ void handLinkTick() {
           (unsigned)connId
         );
 
-        // connect()는 실패했지만 connection handle이 남아있는 경우 —
-        // CHIPSEN 쪽엔 링크가 이미 맺어졌을 수 있으므로(CONNECTED 상태로
-        // 남아 advertising을 재개 안 함) 여기서 바로 delete하지 않고 먼저
-        // 명시적으로 끊어서 정리한다. Client 객체를 살려두는 이유는 NimBLE
-        // 쪽에서 disconnect 이벤트가 끝나기 전에 Client가 사라지면 안 되고,
-        // connection handle이 남은 채로 다음 connect()를 시도하면 그 자체가
-        // busy/already-connected로 거부될 수 있기 때문.
         if (connId != 0xFFFF) {
           Serial.println("# CHIPSEN: 잔여 BLE 링크 정리 시도");
 
@@ -1251,13 +1241,13 @@ void handLinkTick() {
 
           Serial.printf("# CHIPSEN: cleanup disconnect rc=%d\n", rc);
 
-          delay(1000);   // CHIPSEN이 DISCONNECTED 처리하고 다시 advertising 시작할 시간
+          delay(1000);  // 상대(칩센)가 disconnect 처리하고 재광고할 시간 확보 
         }
 
-        // 여기서는 delete하지 않는다 — 같은 Client를 재사용 (HAND_CONNECTING
-        // 진입부의 `if (!pHandClient)`는 이미 있으면 새로 안 만듦).
+        // Client 객체는 재사용을 위해 delete 안함 
       }
-      BLEDevice::startAdvertising();   // 실패 경로 - 반드시 다시 켬
+
+      BLEDevice::startAdvertising();   // 실패했어도 광고는 반드시 재개 
       handState = HAND_IDLE;
       backoffHand();
       break;
@@ -1288,18 +1278,21 @@ void handTestSweep() {
 
 // loop()에서 매번 호출 (모드 판정은 deciceConnected 하나로 끝냄)
 void modeTick() {
+  // 폰 연결돼 있으면 SLAVE, 아니면 MASTER
   ArmbandMode want = deviceConnected ? MODE_SLAVE : MODE_MASTER;
 
+  // 모드가 바뀌는 시점에만 진입 함수 1번 호출 
   if (want != mode) {
     if (want == MODE_SLAVE) enterSlaveMode();
     else                    enterMasterMode();
     mode = want;
   }
 
+  // MASTER 모드(폰 미연결)면 로봇손과의 연결/통신 유지 
   if (mode == MODE_MASTER) {
     handLinkTick();
 #if MARK7_TEST_SWEEP
-    handTestSweep();
+    handTestSweep();     // 테스트 빌드에서만: 손가락 스윕 디버그 동작 
 #endif
   }
 }
@@ -1312,6 +1305,7 @@ void setup() {
   pinMode(powerSwitchPin, INPUT_PULLUP);
   pinMode(trEnablePin, OUTPUT);
 
+  // NeoPixel LED 부팅 
   strip.begin();
   for (int i = 0; i < 10; ++i) {
     for (int j = 0; j < 4; ++j) {
@@ -1321,10 +1315,11 @@ void setup() {
     delay(50);
   }
 
-  digitalWrite(trEnablePin, HIGH);
+  digitalWrite(trEnablePin, HIGH);    // TR 활성화 (센서/모듈 전원 켬)
 
-  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.begin(SDA_PIN, SCL_PIN);       // I2C 통신 시작 (BNO055 센서용)
 
+  // BNO055(IMU 센서) 초기화 - 될 때까지 재시도, LED로 진행 표시 
   Serial.println("# SETUP: BNO055 init 시작 (bno.begin() 대기 — 여기서 안 넘어가면 센서 배선/전원 확인)");
   uint32_t bnoRetries = 0;
   while (!bno.begin()) {
@@ -1332,7 +1327,7 @@ void setup() {
     Serial.printf("# SETUP: bno.begin() 실패, 재시도 중 (%lu회째)\n", (unsigned long)bnoRetries);
     for (int i = 0; i < 15; ++i) {
       for (int j = 0; j < 4; ++j) {
-        strip.setPixelColor(j, i * 4, 0, i * 4);
+        strip.setPixelColor(j, i * 4, 0, i * 4);   // 보라색 깜빡임 (실패/재시도 표시)
       }
       strip.show();
       delay(10);
@@ -1340,6 +1335,7 @@ void setup() {
   }
   Serial.printf("# SETUP: BNO055 init 완료 (재시도 %lu회)\n", (unsigned long)bnoRetries);
 
+  // LED 애니메니션 (청록색, 초기화 완료 표시용)
   for (int i = 0; i < 10; ++i) {
     for (int j = 0; j < 4; ++j) {
       strip.setPixelColor(j, 0, i * 4, i * 4);
@@ -1348,8 +1344,9 @@ void setup() {
     delay(10);
   }
 
-  analogReadResolution(10);
+  analogReadResolution(10);   // ADC(아날로그 입력) 해상도를 10비트로 설정 (EMG 센서 읽기용)
 
+  // LED 애니메이션 (청록색, 점점 어두워짐)
   for (int i = 10; i >= 0; --i) {
     for (int j = 0; j < 4; ++j) {
       strip.setPixelColor(j, 0, i * 4, i * 4);
@@ -1358,19 +1355,21 @@ void setup() {
     delay(10);
   }
 
-  bno.setExtCrystalUse(true);
+  bno.setExtCrystalUse(true);     // BNO055 외부 크리스탈 사용 설정 (정밀도 향상)
   calib = 1;
 
-  BLEDevice::init("ESP32S3_FAST_BLE");
+  // BLE 초기화 및 서버(암밴드→폰 통신) 설정 시작 
+  BLEDevice::init("ESP32S3_FAST_BLE");       // BLE 스택 초기화, 기기 이름 설정 
 
 #if defined(CONFIG_NIMBLE_ENABLED)
-  BLEDevice::setCustomGapHandler(bleGapDebug);
+  BLEDevice::setCustomGapHandler(bleGapDebug);     // GAP 이벤트 디버그 로거 등록(연결 관련 이벤트 전부 시리얼에 찍힘)
 #endif
 
-  BLEDevice::setMTU(247);
+  BLEDevice::setMTU(247);    // MTU(한 번에 주고받는 데이터 크기) 247바이트로 설정 요청 
 
+  // 암밴드를 BLE 서버(GATT Server)로 만듦 (폰이 여기 연결하러 옴)
   BLEServer* pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new MyServerCallbacks());
+  pServer->setCallbacks(new MyServerCallbacks());    // 폰 연결/해제 시 호출될 콜백 등록 
 
   BLEService* pService = pServer->createService(SERVICE_UUID);
 
@@ -1738,15 +1737,12 @@ void checkWeightReceiveUsb() {
 // LOOP — recorder loop + inference hook
 // =========================
 void loop() {
-  // BLE 가중치 수신 콜백(onWrite)에서 예약해둔 재부팅 처리 — 콜백 밖에서
-  // 처리해야 그 write의 ATT 확인 응답/NOTIFY가 막히지 않음 (위 설명 참고).
+  // 예약된 재부팅 실행 
   if (pendingRestart && millis() >= restartAtMs) {
     ESP.restart();
   }
 
-  // onWrite()가 미뤄둔 실제 저장. CRC 검증(53KB 순회) + LittleFS.write(53KB)를
-  // 여기서 한다 — BLE 스택 태스크가 아니라 이 Arduino 메인 루프에서 블로킹돼야
-  // BLE 연결 인터벌을 안 놓친다. 전송 중 재부팅되던 문제가 이 지점이었다.
+  // 예약된 가중치 저장 처리 (CRC 검증 후 파일 저장)
   if (pendingWeightSave) {
     pendingWeightSave = false;
 
@@ -1759,23 +1755,19 @@ void loop() {
     WeightSaveResult result = saveWeightsIfCrcOk(payload, declaredLen, crcRecv);
     resetBleWeightReceive();
 
-    notifyWeightsResult(weightSaveResultStr(result));
+    notifyWeightsResult(weightSaveResultStr(result));     // 결과 폰에 알림 
     if (result == WSAVE_OK) {
       pendingRestart = true;
-      restartAtMs = millis() + 300;  // NOTIFY가 실제로 나갈 시간만 살짝 확보
+      restartAtMs = millis() + 300;  // NOTIFY 나갈 시간 확보 후 재부팅 
     }
   }
 
   static uint32_t tick = 0;
-  tick = micros();
+  tick = micros();      // 주기 계산용 시작 시간 
 
-  checkWeightReceiveUsb();
+  checkWeightReceiveUsb();       // USB로도 가중치 수신 체크
 
-  // 가중치 수신이 중간에 멈춘 채 방치된 경우 버퍼를 버린다. 응답은 문서에
-  // 이미 정의된 ERR:SIZE를 쓴다("LENGTH 필드와 실제 수신 바이트 수 불일치" —
-  // 정확히 이 상황이고, 안드로이드가 이미 처리하는 코드다).
-  // pendingWeightSave 대기 중(=수신은 이미 완료, 저장 처리만 남음)에는 이
-  // 타임아웃을 적용하지 않는다 — bleWeightBufLen > 0인 게 정상 상태다.
+  // 가중치 수신 중단된 채 방치되면 타임아웃 처리 
   if (!pendingWeightSave && bleWeightBufLen > 0 &&
       millis() - bleWeightLastChunkMs > BLE_WEIGHT_IDLE_TIMEOUT_MS) {
     Serial.println("# BLE: 가중치 수신 타임아웃 — 버퍼 폐기");
@@ -1783,16 +1775,13 @@ void loop() {
     notifyWeightsResult("ERR:SIZE");
   }
 
-  shutdownOnSwitch();
+  shutdownOnSwitch();     // 전원 스위치 확인 
 
-  // 폰 연결 여부에 따라 SLAVE/MASTER를 판정하고, MASTER면 MARK7 링크를
-  // 진행한다. shutdownOnSwitch() 뒤에 두는 이유: 스캔이 최대 SCAN_SECONDS초
-  // 블로킹하므로 그 직전에 전원 스위치를 한 번 확인해두는 편이 낫다.
-  modeTick();
+  modeTick();   // 폰 연결 여부로 SLAVE/MASTER 판정, MASTER면 로봇손 링크 진행 
 
-  int pos = getEMG();
+  int pos = getEMG();      // EMG 샘플링 
 
-  // ─── BLE notify every 20 samples (UNCHANGED) ─────────────────────────
+  // ─── 20샘플마다 EMG 데이터 BLE notify ─────────────────────────
   if (pos == 0) {
     if (deviceConnected) {
       pCharacteristic->setValue(txBuffer, PACKET_SIZE);
@@ -1800,8 +1789,7 @@ void loop() {
     }
   }
 
-  // ─── NEW: inference every INFER_HOP samples, once window is full and
-  //          weights have been loaded from LittleFS ─────────────────────
+  // ─── 추론 윈도우 다 차면 신경망 추론 실행 ─────────────────────
   if (nn.isLoaded() &&
       infer_total_samples >= WINDOW_SIZE &&
       infer_samples_since_last >= (uint32_t)INFER_HOP) {
@@ -1809,6 +1797,7 @@ void loop() {
     runInference();
   }
 
+  // 일정 주기 유지를 위한 딜레이 
   int delayMicro = periodMicro - micros() + tick;
   if (delayMicro > 0 && delayMicro < periodMicro) {
     delayMicroseconds(delayMicro);
