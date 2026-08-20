@@ -29,6 +29,7 @@
 #include <BLE2902.h>
 #include <LittleFS.h>
 #include <Preferences.h>    // 로봇 의수 MAC 주소를 ESP32의 NVS에 저장
+#include <esp_system.h>     // esp_reset_reason() — 부팅 직후 리셋 원인 로깅용
 
 // connId는 있는데 isConnected=false인 반쪽짜리 링크(=BLEClient가 놓친 상태)를
 // forceDisconnectChipsen()에서 ble_gap_terminate()로 직접 끊기 위해 필요.
@@ -47,6 +48,7 @@
 
 #define PAIR_HDR         0xE0
 #define PAIR_PACKET_LEN  8       // 헤더 1B + MAC 6B + 체크섬 1B = 8B
+#define PAIR_HDR_CLEAR   0xE1    // 저장된 마스터 MAC 삭제 명령 (1바이트 단독 write)
 
 // =========================
 // 설정 (UNCHANGED FROM RECORDER)
@@ -68,8 +70,8 @@ static const char* CHARACTERISTIC_UUID_WEIGHTS = "abcd1234-5678-1234-5678-abcdef
 static const char* CHARACTERISTIC_UUID_PAIR = "abcd1234-5678-1234-5678-abcdef123459";   // 페어링용 
 
 // MARK7(로봇 의수) BLE 모듈. MAC: 5C:F2:86:49:3A:AA (AT 명령어로 실측 확인됨 —
-// 예전엔 3C:A5:51:99:BB:5F로 적혀있었는데 그건 다른 개체/오기였다. line 76
-// MARK7_MAC_FORCED가 실제 스캔 타겟이고 이 값과 일치함)
+// 예전엔 3C:A5:51:99:BB:5F로 적혀있었는데 그건 다른 개체/오기였다.)
+// 이 MAC은 NVS(pairing/master_mac)에 등록해서 쓴다 — 하드코딩 fallback 없음.
 //
 // 실물 GATT 구조 — reference/BLE_Scanner.png (기기명 CHIPSEN, NOT BONDED):
 
@@ -80,11 +82,6 @@ static const char* CHARACTERISTIC_UUID_PAIR = "abcd1234-5678-1234-5678-abcdef123
 static const char* MARK7_SERVICE_UUID = "0000fff0-0000-1000-8000-00805f9b34fb";
 static const char* MARK7_CMD_UUID     = "0000fff2-0000-1000-8000-00805f9b34fb";  // write
 static const char* MARK7_STATUS_UUID  = "0000fff1-0000-1000-8000-00805f9b34fb";  // notify
-
-// ── 벤치 테스트용 MAC 강제 지정 ─────────────────────────────────────────
-
-#define MARK7_MAC_OVERRIDE 1
-static const uint8_t MARK7_MAC_FORCED[6] = { 0x5C, 0xF2, 0x86, 0x49, 0x3A, 0xAA };
 
 // ── 의수 명령 프로토콜 (hand.py:1-8, build_cmd() 기준) ──────────────────
 // CMD 12byte: HDR(0xFF) + finger_sel + speed + current + pos[6] + dir + XOR
@@ -152,16 +149,25 @@ uint32_t crc32_calc(const uint8_t* data, size_t len) {
 // 재부팅은 호출자가 한다 (USB는 Serial.println 후, BLE는 notify 후 —
 // 응답을 실제로 다 보낸 뒤에 재부팅해야 상대방이 결과를 받을 수 있음).
 WeightSaveResult saveWeightsIfCrcOk(const uint8_t* payload, uint32_t totalBytes, uint32_t crcRecv) {
+  uint32_t t0 = millis();
   uint32_t crcCalc = crc32_calc(payload, totalBytes);
+  Serial.printf("# WSAVE: CRC 계산 %lu ms\n", (unsigned long)(millis() - t0));
+
   if (crcCalc != crcRecv) {
     Serial.printf("# 가중치 CRC 불일치 (calc=%08X recv=%08X)\n", crcCalc, crcRecv);
     return WSAVE_ERR_CRC;
   }
 
+  t0 = millis();
   File f = LittleFS.open(WEIGHTS_TMP_PATH, "w");
-  if (!f) return WSAVE_ERR_WRITE;
+  if (!f) {
+    Serial.println("# WSAVE: LittleFS.open 실패");
+    return WSAVE_ERR_WRITE;
+  }
   size_t written = f.write(payload, totalBytes);
   f.close();
+  Serial.printf("# WSAVE: flash write %u/%u bytes, %lu ms\n",
+                (unsigned)written, totalBytes, (unsigned long)(millis() - t0));
   if (written != totalBytes) {
     LittleFS.remove(WEIGHTS_TMP_PATH);
     return WSAVE_ERR_WRITE;
@@ -201,34 +207,10 @@ Preferences pairPrefs;
 uint8_t masterMac[6] = {0};
 bool hasMasterMac = false;
 
-// ── MAC fallback 관리 ──────────────────────────────────────────────
-// NVS에 저장된 MAC을 우선 사용하되, 연속 스캔 실패가 임계치를 넘으면
-// 벤치 테스트용 하드코딩 MAC(MARK7_MAC_FORCED)으로 전환한다.
-// loadMasterMac()이 이 밑의 switchToFallbackMac()/변수들을 바로 쓰기 때문에,
-// handScanSeenCount 근처(파일 뒤쪽)가 아니라 반드시 loadMasterMac()보다
-// 앞에 선언해야 한다 — 안 그러면 "not declared in this scope"로 컴파일 실패.
-#if MARK7_MAC_OVERRIDE
-#define MARK7_SCAN_FAIL_THRESHOLD 3
-static uint32_t handScanFailCount = 0;
-static bool     usingFallbackMac = false;
-
-// 하드코딩된 벤치 테스트용 MAC으로 전환한다.
-// - NVS가 비어있을 때: loadMasterMac()에서 즉시 호출
-// - NVS 값으로 연속 스캔 실패가 임계치를 넘었을 때: handLinkTick()에서 호출
-void switchToFallbackMac() {
-  memcpy(masterMac, MARK7_MAC_FORCED, sizeof(masterMac));
-  hasMasterMac = true;
-  usingFallbackMac = true;
-  handScanFailCount = 0;
-  Serial.printf(
-    "# PAIR: [FALLBACK] 하드코딩 MAC으로 전환 %02X:%02X:%02X:%02X:%02X:%02X\n",
-    masterMac[0], masterMac[1], masterMac[2],
-    masterMac[3], masterMac[4], masterMac[5]
-  );
-}
-#endif
-
-// ESP32에 저장된 로봇 의수 MAC을 불러오고, 저장 여부를 확인하는 함수
+// ESP32에 저장된 로봇 의수 MAC을 불러오고, 저장 여부를 확인하는 함수.
+// NVS(pairing/master_mac)에 저장된 값만 쓴다 — 하드코딩 fallback 없음.
+// 저장된 게 없으면 hasMasterMac이 false로 남고, handLinkTick()은
+// PC/폰 페어링 앱으로 MAC이 등록될 때까지 아무 것도 하지 않는다.
 void loadMasterMac() {
   pairPrefs.begin("pairing", true);
 
@@ -241,10 +223,6 @@ void loadMasterMac() {
   pairPrefs.end();
 
   hasMasterMac = (n == sizeof(masterMac));
-#if MARK7_MAC_OVERRIDE
-  usingFallbackMac = false;
-  handScanFailCount = 0;
-#endif
 
   if (hasMasterMac) {
     Serial.printf(
@@ -257,11 +235,7 @@ void loadMasterMac() {
       masterMac[5]
     );
   } else {
-    Serial.println("# PAIR: 저장된 마스터 없음");
-#if MARK7_MAC_OVERRIDE
-    // NVS 자체가 비어있으면 처음부터 하드코딩 MAC으로 시작
-    switchToFallbackMac();
-#endif
+    Serial.println("# PAIR: 저장된 마스터 없음 — 페어링 앱으로 MAC을 등록해야 함");
   }
 }
 
@@ -337,7 +311,12 @@ class WeightsCharCallbacks : public BLECharacteristicCallbacks {
     const uint8_t* data = (const uint8_t*)chunk.c_str();
     size_t len = chunk.length();
 
-    bleWeightLastChunkMs = millis();   // 수신 타임아웃 감시용 (loop()에서 판정)
+    uint32_t now = millis();
+    Serial.printf("# WCHUNK len=%u bufLen=%u dt=%lu heap=%u\n",
+                   (unsigned)len, (unsigned)bleWeightBufLen,
+                   (unsigned long)(now - bleWeightLastChunkMs), ESP.getFreeHeap());
+
+    bleWeightLastChunkMs = now;   // 수신 타임아웃 감시용 (loop()에서 판정)
 
     if (bleWeightBufLen + len > BLE_WEIGHT_BUF_MAX) {
       Serial.println("# BLE: 가중치 수신 버퍼 초과 — 리셋");
@@ -398,6 +377,24 @@ class PairCharCallbacks : public BLECharacteristicCallbacks  {
 
     const uint8_t* d = c->getData();
     size_t len = c->getLength();
+
+    // 0. CLEAR 명령: 1바이트(0xE1)만 오면 저장된 마스터 MAC을 지운다.
+    //    NVS 자체에서 키를 지워야 hasMasterMac이 정직하게 false가 되고
+    //    onRead()가 "비어있음"을 돌려준다 — 00:00:.. 같은 가짜 MAC을
+    //    저장하는 방식은 "페어링 안 됨"과 "그 MAC으로 페어링됨"을 구분 못
+    //    하게 만들어서 쓰지 않는다.
+    if (len == 1 && d[0] == PAIR_HDR_CLEAR) {
+      pairPrefs.begin("pairing", false);
+      pairPrefs.remove("master_mac");
+      pairPrefs.end();
+
+      memset(masterMac, 0, sizeof(masterMac));
+      hasMasterMac = false;
+
+      notifyPairResult("OK:CLEAR");
+      Serial.println("# PAIR: 저장된 마스터 MAC 삭제됨");
+      return;
+    }
 
     // 1. 길이 + 헤더 검사
     if (len != PAIR_PACKET_LEN || d[0] != PAIR_HDR) {
@@ -524,6 +521,15 @@ static const int N_VOTE     = 3;
 static const float VOTE_THRESHOLD = 0.34f;
 static const char* CLASS_NAMES[N_CLASSES] = { "rest", "flexion", "extension", "close", "supination", "pronation" };
 
+// quiet-override — 근신호가 조용하면 모델 예측과 무관하게 rest(0)로 강제.
+// 안드로이드 ClassifyViewModel.kt의 forceRest(quiet-hysteresis)와 같은 안전장치를
+// 펌웨어 쪽에도 추가한 것 — Android 쪽 forceRest는 폰 화면 표시에만 적용되고
+// MARK7으로 나가는 인덱스에는 전혀 안 걸려서, 가만히 있어도 모델이 close로
+// 오분류하면 그대로 의수에 전달돼 손이 쥐어지는 문제가 있었음. 값은 실기기
+// 재검증 필요(임시 기본값) — 노이즈 크면 QUIET_SPREAD_THRESHOLD를 올릴 것.
+static const int QUIET_SPREAD_THRESHOLD   = 15;  // 채널당 윈도우 내 peak-to-peak(0~255 raw) 이 값 미만이면 "조용함"
+static const int QUIET_HYSTERESIS_WINDOWS = 2;   // 연속 조용 윈도우 수 (~50ms/윈도우 × 2 ≈ Android REST_HYSTERESIS_MS=100ms와 동급)
+
 // Circular sample buffer (mirrors what BLE sends, AFTER the same -250+clamp)
 static int16_t infer_buffer[WINDOW_SIZE][N_CHANNEL];
 static int     infer_write_idx = 0;
@@ -545,7 +551,7 @@ static const int N_TIMING_INF = 20;
 // 껐는데, `&`가 `==`/`>=`보다 우선순위가 낮아서 실제로는 `false & (조건)`이
 // 아니라 컴파일러 경고 없이 항상 거짓인 죽은 코드였다. 의도를 명시적으로
 // 드러내려고 상수 플래그로 바꿨다 (0이면 최적화 단계에서 통째로 빠진다).
-#define DEBUG_ADC_STATS      0
+#define DEBUG_ADC_STATS      1
 #define DEBUG_INFER_LATENCY  0
 
 // 모드 전환 (슬레이브 ↔ 마스터)
@@ -738,7 +744,7 @@ void forceDisconnectChipsen() {
 //     출력해서 사람이 읽는 표기와 맞춰준다
 //   → getNative()[i] == (사람이 읽는 순서의 MAC)[5-i]
 //
-// masterMac/MARK7_MAC_FORCED는 항상 사람이 읽는 순서(§4-2 "정순")로 들고
+// masterMac은 항상 사람이 읽는 순서(§4-2 "정순")로 들고
 // 있으므로, getNative()와 그대로 memcmp하면 실제 기기와 절대 일치하지 않는다
 // (MAC이 우연히 팔린드롬이 아닌 이상 100% 실패). 반드시 이 함수로 비교할 것.
 bool nativeAddrMatchesHandMac(const uint8_t* native) {
@@ -1108,22 +1114,10 @@ void handLinkTick() {
                         masterMac[0], masterMac[1], masterMac[2], masterMac[3], masterMac[4], masterMac[5],
                         SCAN_SECONDS);
         } else {
-          Serial.printf("# HAND: MARK7(%02X:%02X:%02X:%02X:%02X:%02X) 못 찾음 — 광고 %lu건 봤지만 이 MAC과 일치하는 건 없음 (MARK7_MAC_FORCED 확인)\n",
+          Serial.printf("# HAND: MARK7(%02X:%02X:%02X:%02X:%02X:%02X) 못 찾음 — 광고 %lu건 봤지만 이 MAC과 일치하는 건 없음 (NVS에 등록된 MAC 확인)\n",
                         masterMac[0], masterMac[1], masterMac[2], masterMac[3], masterMac[4], masterMac[5],
                         (unsigned long)handScanSeenCount);
         }
-
-#if MARK7_MAC_OVERRIDE
-        // NVS 저장 MAC으로 계속 실패하면 일정 횟수 후 하드코딩 fallback MAC으로 전환 
-        if (!usingFallbackMac) {
-          handScanFailCount++;
-          Serial.printf("# PAIR: NVS 주소 스캔 실패 %lu/%d회\n",
-                        (unsigned long)handScanFailCount, MARK7_SCAN_FAIL_THRESHOLD);
-          if (handScanFailCount >= MARK7_SCAN_FAIL_THRESHOLD) {
-            switchToFallbackMac();
-          }
-        }
-#endif
 
         BLEDevice::startAdvertising();    // 재시도 대기 중엔 폰이 연결할 수 있게 광고 재개
         backoffHand();
@@ -1211,9 +1205,6 @@ void handLinkTick() {
         if (resolveHandChars()) {      // 필요한 characteristic(FFF0/1/2 등) 찾기 성공하면 
           handState = HAND_READY;
           handRetryMs = HAND_RETRY_MS_MIN;
-#if MARK7_MAC_OVERRIDE
-          handScanFailCount = 0;            // 연결 성공했으니 실패 카운터 리셋
-#endif
           handReadyMs = millis();           // STATUS 무응답 워치독 기준점 리셋
           BLEDevice::startAdvertising();    // 폰 연결 경로도 계속 열어둠 
           setStatusLed(0, 16, 0);           // 초록 = MASTER 정상 동작 중
@@ -1302,6 +1293,11 @@ void modeTick() {
 // =========================
 void setup() {
   Serial.begin(115200);
+  delay(100);
+  // 리셋 원인 로깅 (esp_reset_reason_t 값) —
+  // 0=UNKNOWN, 1=POWERON, 2=EXT, 3=SW(esp_restart 호출, 정상 재부팅),
+  // 4=PANIC, 5=INT_WDT, 6=TASK_WDT, 7=WDT, 8=DEEPSLEEP, 9=BROWNOUT, 10=SDIO
+  Serial.printf("# BOOT: reset_reason=%d\n", (int)esp_reset_reason());
   pinMode(powerSwitchPin, INPUT_PULLUP);
   pinMode(trEnablePin, OUTPUT);
 
@@ -1548,6 +1544,28 @@ void runInference() {
   if (vote_count < N_VOTE) vote_count++;
   int final_pred = getMostFrequent();
 
+  // quiet-override: 이번 윈도우 raw 신호(snapshot, 전처리 전)의 채널별
+  // peak-to-peak이 전부 QUIET_SPREAD_THRESHOLD 미만인 상태가
+  // QUIET_HYSTERESIS_WINDOWS회 연속되면, 모델이 뭐라 예측했든 rest로 덮어쓴다.
+  // peak-to-peak을 쓰는 이유 — ADC_read-250 오프셋이 채널/개체마다 조금씩
+  // 다를 수 있어도(캘리브레이션 없음) 절대 레벨과 무관하게 안정적으로 "지금
+  // 움직이는가"만 판단할 수 있음.
+  bool anyChannelActive = false;
+  for (int ch = 0; ch < N_CHANNEL; ch++) {
+    int mn = 999, mx = -999;
+    for (int i = 0; i < WINDOW_SIZE; i++) {
+      int v = snapshot[i][ch];
+      if (v < mn) mn = v;
+      if (v > mx) mx = v;
+    }
+    if (mx - mn > QUIET_SPREAD_THRESHOLD) { anyChannelActive = true; break; }
+  }
+  static int quietWindowCount = 0;
+  quietWindowCount = anyChannelActive ? 0 : quietWindowCount + 1;
+  if (quietWindowCount >= QUIET_HYSTERESIS_WINDOWS) {
+    final_pred = 0;  // rest
+  }
+
   // Debug ADC stats every 5 inferences
   static int adc_dbg = 0;
   if (DEBUG_ADC_STATS && (++adc_dbg % 5) == 0) {
@@ -1591,22 +1609,20 @@ void runInference() {
     pCharacteristicPred->notify();
 
   } else if (mode == MODE_MASTER && handState == HAND_READY && pHandCmd) {
-    // MASTER: MARK7로 제스처 명령
+    // MASTER: MARK7로 제스처 인덱스 전송 (포맷: "<index>", 0~5, CLASS_NAMES 순서와 동일)
+    // 예전엔 buildGestureCmd()로 12바이트 바이너리 모터 명령을 만들어 보냈지만,
+    // MARK7 수신측 프로토콜이 인덱스를 직접 받는 방식으로 바뀌어서 그 변환 없이
+    // 예측 인덱스를 그대로 전송한다. rest/close 외 제스처(손목 계열)에 대한
+    // 매핑 여부는 이제 MARK7(수신측)이 결정한다.
     static int        lastSentPred = -1;
     static uint32_t   lastSendMs   = 0;
     if (final_pred != lastSentPred || millis() - lastSendMs > HAND_KEEPALIVE_MS) {
-      uint8_t cmd[MARK7_CMD_LEN];
-      // 매핑이 없는 제스처(손목 계열)는 아무것도 보내지 않는다 — buildGestureCmd() 주석 참고
-      if (buildGestureCmd(final_pred, cmd)) {
-        // 20Hz 경로이므로 no-response. with-response는 connection interval만큼
-        // 블로킹해서 781µs 샘플링 루프를 깨뜨린다.
-        bool ok = pHandCmd->writeValue(cmd, MARK7_CMD_LEN, false);
-        logHandTx(cmd, CLASS_NAMES[final_pred], ok);
-      } else if (final_pred != lastSentPred) {
-        // 이 제스처는 아직 매핑이 없다 — "왜 안 보내지?"를 조용히 넘기지 않고
-        // 남긴다. final_pred가 바뀔 때만(keepalive 틱마다는 X) 찍어서 스팸 방지.
-        Serial.printf("# HAND: %s는 매핑 없음 — 전송 안 함\n", CLASS_NAMES[final_pred]);
-      }
+      char idx_msg[4];
+      snprintf(idx_msg, sizeof(idx_msg), "%d", final_pred);
+      // 20Hz 경로이므로 no-response. with-response는 connection interval만큼
+      // 블로킹해서 781µs 샘플링 루프를 깨뜨린다.
+      bool ok = pHandCmd->writeValue((uint8_t*)idx_msg, strlen(idx_msg), false);
+      Serial.printf("# HAND TX%s: %s (%s)\n", ok ? "" : " 실패", idx_msg, CLASS_NAMES[final_pred]);
       lastSentPred = final_pred;
       lastSendMs = millis();
     }
@@ -1745,6 +1761,8 @@ void loop() {
   // 예약된 가중치 저장 처리 (CRC 검증 후 파일 저장)
   if (pendingWeightSave) {
     pendingWeightSave = false;
+    Serial.printf("# WSAVE: 시작 heap=%u\n", ESP.getFreeHeap());
+    uint32_t tSaveStart = millis();
 
     uint32_t declaredLen;
     memcpy(&declaredLen, bleWeightBuf + 4, 4);
@@ -1752,10 +1770,17 @@ void loop() {
     uint32_t crcRecv;
     memcpy(&crcRecv, bleWeightBuf + 8 + declaredLen, 4);
 
+    Serial.printf("# WSAVE: declaredLen=%u, CRC 계산 시작\n", declaredLen);
+
     WeightSaveResult result = saveWeightsIfCrcOk(payload, declaredLen, crcRecv);
+
+    Serial.printf("# WSAVE: 완료 result=%s elapsed=%lu ms heap=%u\n",
+                  weightSaveResultStr(result),
+                  (unsigned long)(millis() - tSaveStart), ESP.getFreeHeap());
+
     resetBleWeightReceive();
 
-    notifyWeightsResult(weightSaveResultStr(result));     // 결과 폰에 알림 
+    notifyWeightsResult(weightSaveResultStr(result));     // 결과 폰에 알림
     if (result == WSAVE_OK) {
       pendingRestart = true;
       restartAtMs = millis() + 300;  // NOTIFY 나갈 시간 확보 후 재부팅 
