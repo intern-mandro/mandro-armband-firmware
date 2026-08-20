@@ -521,15 +521,6 @@ static const int N_VOTE     = 3;
 static const float VOTE_THRESHOLD = 0.34f;
 static const char* CLASS_NAMES[N_CLASSES] = { "rest", "flexion", "extension", "close", "supination", "pronation" };
 
-// quiet-override — 근신호가 조용하면 모델 예측과 무관하게 rest(0)로 강제.
-// 안드로이드 ClassifyViewModel.kt의 forceRest(quiet-hysteresis)와 같은 안전장치를
-// 펌웨어 쪽에도 추가한 것 — Android 쪽 forceRest는 폰 화면 표시에만 적용되고
-// MARK7으로 나가는 인덱스에는 전혀 안 걸려서, 가만히 있어도 모델이 close로
-// 오분류하면 그대로 의수에 전달돼 손이 쥐어지는 문제가 있었음. 값은 실기기
-// 재검증 필요(임시 기본값) — 노이즈 크면 QUIET_SPREAD_THRESHOLD를 올릴 것.
-static const int QUIET_SPREAD_THRESHOLD   = 15;  // 채널당 윈도우 내 peak-to-peak(0~255 raw) 이 값 미만이면 "조용함"
-static const int QUIET_HYSTERESIS_WINDOWS = 2;   // 연속 조용 윈도우 수 (~50ms/윈도우 × 2 ≈ Android REST_HYSTERESIS_MS=100ms와 동급)
-
 // Circular sample buffer (mirrors what BLE sends, AFTER the same -250+clamp)
 static int16_t infer_buffer[WINDOW_SIZE][N_CHANNEL];
 static int     infer_write_idx = 0;
@@ -1485,15 +1476,10 @@ int getEMG() {
 // =========================
 // NEW: Inference routine
 // =========================
-// vote_buf는 시프트 레지스터다 — runInference()가 값을 왼쪽으로 밀고 최신
-// 예측을 항상 vote_buf[N_VOTE-1]에 넣는다. 따라서 아직 다 안 채워진 워밍업
-// 구간(vote_count < N_VOTE)에 세야 할 것은 앞쪽이 아니라 **뒤쪽** n_seen개다.
-// 앞쪽을 세면 한 번도 쓰이지 않은 0(= class 0 "rest")이 표에 섞여 부팅 직후
-// 두 번의 추론이 rest 쪽으로 끌려간다.
 int getMostFrequent() {
   int counts[N_CLASSES] = {0};
   int n_seen = (vote_count < N_VOTE) ? vote_count : N_VOTE;
-  for (int i = N_VOTE - n_seen; i < N_VOTE; i++) {
+  for (int i = 0; i < n_seen; i++) {
     int p = vote_buf[i];
     if (p >= 0 && p < N_CLASSES) counts[p]++;
   }
@@ -1504,11 +1490,8 @@ int getMostFrequent() {
       best = i;
     }
   }
-  // 과반이 없으면 최신 예측으로 폴백. 최신은 항상 마지막 슬롯이다 — 이전엔
-  // vote_buf[(vote_count-1) % N_VOTE]였는데 vote_count가 N_VOTE로 포화된
-  // 뒤에만 우연히 맞고, 워밍업 2회는 엉뚱한 슬롯을 읽었다.
   if (best_count < VOTE_THRESHOLD * N_VOTE) {
-    return vote_buf[N_VOTE - 1];
+    return vote_buf[(vote_count - 1) % N_VOTE];
   }
   return best;
 }
@@ -1543,28 +1526,6 @@ void runInference() {
   vote_buf[N_VOTE - 1] = raw_pred;
   if (vote_count < N_VOTE) vote_count++;
   int final_pred = getMostFrequent();
-
-  // quiet-override: 이번 윈도우 raw 신호(snapshot, 전처리 전)의 채널별
-  // peak-to-peak이 전부 QUIET_SPREAD_THRESHOLD 미만인 상태가
-  // QUIET_HYSTERESIS_WINDOWS회 연속되면, 모델이 뭐라 예측했든 rest로 덮어쓴다.
-  // peak-to-peak을 쓰는 이유 — ADC_read-250 오프셋이 채널/개체마다 조금씩
-  // 다를 수 있어도(캘리브레이션 없음) 절대 레벨과 무관하게 안정적으로 "지금
-  // 움직이는가"만 판단할 수 있음.
-  bool anyChannelActive = false;
-  for (int ch = 0; ch < N_CHANNEL; ch++) {
-    int mn = 999, mx = -999;
-    for (int i = 0; i < WINDOW_SIZE; i++) {
-      int v = snapshot[i][ch];
-      if (v < mn) mn = v;
-      if (v > mx) mx = v;
-    }
-    if (mx - mn > QUIET_SPREAD_THRESHOLD) { anyChannelActive = true; break; }
-  }
-  static int quietWindowCount = 0;
-  quietWindowCount = anyChannelActive ? 0 : quietWindowCount + 1;
-  if (quietWindowCount >= QUIET_HYSTERESIS_WINDOWS) {
-    final_pred = 0;  // rest
-  }
 
   // Debug ADC stats every 5 inferences
   static int adc_dbg = 0;

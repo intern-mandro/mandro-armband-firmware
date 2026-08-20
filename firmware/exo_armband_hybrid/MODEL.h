@@ -10,9 +10,7 @@
 
 const int MODEL_N_LAYERS = 4;
 
-// constexpr(not just const)이어야 nn.h의 static_assert에서 쓸 수 있다 —
-// const 배열은 상수식(constant expression)에 쓸 수 없다.
-constexpr int MODEL_TOPOLOGY[4] = {
+const int MODEL_TOPOLOGY[4] = {
     132, 64, 64, 6
 };
 

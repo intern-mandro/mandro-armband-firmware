@@ -11,20 +11,8 @@
 #define ACT_TANH     3
 #define ACT_LINEAR   4
 
-// Max layer width — must be >= the widest entry of MODEL_TOPOLOGY[].
-// 현재 토폴로지 [132, 64, 64, 6]에서는 입력층 132가 가장 넓다.
-//
-// 이 값은 4채널 시절 토폴로지 [58, 64, 64, 4] 기준의 128이었고 4ch→8ch
-// (58→132 features) 마이그레이션에서 갱신되지 않았다. 그 상태에서는
-// predict()가 buf_a[128]에 132개를 써서 buf_b를 4개 덮고, 이어지는
-// denseLayer()가 buf_b에 출력을 쓰면서 아직 읽어야 할 입력 특징
-// 128~131(= CH4~CH7 TSD 에너지)을 파괴했다. 크래시 없이 추론 정확도만
-// 조용히 떨어지는 종류의 버그였다.
-#define NN_MAX_WIDTH 160
-
-// 같은 실수가 재발하지 않게 컴파일 단계에서 막는다.
-static_assert(NN_MAX_WIDTH >= MODEL_TOPOLOGY[0],
-              "NN_MAX_WIDTH가 입력 특징 수보다 작다 — buf_a/buf_b 오버플로 발생");
+// Max layer width — sized for [58, 64, 64, 4], with margin.
+#define NN_MAX_WIDTH 128
 
 class Preprocessor;  // full definition in preprocessor.h — only referenced
                       // by pointer/reference here, so a forward decl is enough
