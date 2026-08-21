@@ -207,6 +207,16 @@ Preferences pairPrefs;
 uint8_t masterMac[6] = {0};
 bool hasMasterMac = false;
 
+// PAYLOAD 검증(형식+체크섬)까지만 onWrite()에서 동기로 하고, 실제 NVS 쓰기/삭제는
+// loop()로 미룸 — WeightsCharCallbacks/pendingWeightSave와 같은 이유(아래 그
+// 선언부 주석 참고): onWrite()는 BLE 스택 태스크 컨텍스트라 그 안에서 동기 flash
+// 쓰기를 하면 연결 인터벌을 놓치거나 브라운아웃/워치독 재부팅까지 갈 수 있음.
+// 페어링 앱(안드로이드/PC) 쪽에서 "OK:PAIR"/"OK:CLEAR" notify가 가끔 늦거나
+// 아예 안 오는 증상이 있었는데, 원인이 이거였을 가능성이 높음(2026-08-22).
+static volatile bool pendingPairSave = false;
+static uint8_t pendingMasterMac[6] = {0};
+static volatile bool pendingPairClear = false;
+
 // ESP32에 저장된 로봇 의수 MAC을 불러오고, 저장 여부를 확인하는 함수.
 // NVS(pairing/master_mac)에 저장된 값만 쓴다 — 하드코딩 fallback 없음.
 // 저장된 게 없으면 hasMasterMac이 false로 남고, handLinkTick()은
@@ -383,25 +393,23 @@ class PairCharCallbacks : public BLECharacteristicCallbacks  {
     //    onRead()가 "비어있음"을 돌려준다 — 00:00:.. 같은 가짜 MAC을
     //    저장하는 방식은 "페어링 안 됨"과 "그 MAC으로 페어링됨"을 구분 못
     //    하게 만들어서 쓰지 않는다.
+    //    실제 NVS 삭제는 loop()에서 처리(위 pendingPairClear 선언부 주석 참고) —
+    //    여기선 플래그만 세우고 바로 return, notify도 loop()가 지운 뒤에 보냄.
     if (len == 1 && d[0] == PAIR_HDR_CLEAR) {
-      pairPrefs.begin("pairing", false);
-      pairPrefs.remove("master_mac");
-      pairPrefs.end();
-
-      memset(masterMac, 0, sizeof(masterMac));
-      hasMasterMac = false;
-
-      notifyPairResult("OK:CLEAR");
-      Serial.println("# PAIR: 저장된 마스터 MAC 삭제됨");
+      if (pendingPairSave || pendingPairClear) {
+        Serial.println("# PAIR: 이전 요청 처리 대기 중 — CLEAR 무시");
+        return;
+      }
+      pendingPairClear = true;
       return;
     }
 
-    // 1. 길이 + 헤더 검사
+    // 1. 길이 + 헤더 검사 (동기, 빠름 — flash 접근 없음)
     if (len != PAIR_PACKET_LEN || d[0] != PAIR_HDR) {
 
       Serial.printf(
-        "# PAIR: 형식 불일치 (len=%u, hdr=%02X)\n", 
-        (unsigned)len, 
+        "# PAIR: 형식 불일치 (len=%u, hdr=%02X)\n",
+        (unsigned)len,
         len ? d[0] : 0
       );
 
@@ -410,7 +418,7 @@ class PairCharCallbacks : public BLECharacteristicCallbacks  {
       return;
     }
 
-    // 2. XOR checksum 검사
+    // 2. XOR checksum 검사 (동기, 빠름)
     uint8_t chk = 0;
 
     for (int i = 1; i < PAIR_PACKET_LEN - 1; ++i) {
@@ -422,38 +430,18 @@ class PairCharCallbacks : public BLECharacteristicCallbacks  {
       Serial.println("# PAIR: 체크섬 불일치");
 
       notifyPairResult("ERR:PAIR_CRC");
-      
+
       return;
     }
 
-    // 3. MAC 6byte 복사
-    memcpy(masterMac, d + 1, 6);
-
-    // 4. NVS에 저장
-    pairPrefs.begin("pairing", false);  // pairing 저장공간 열기 
-
-    pairPrefs.putBytes(
-      "master_mac", 
-      masterMac, 
-      6
-    );
-
-    pairPrefs.end();
-
-    hasMasterMac = true;   // 현재 유효한 마스터주소 있다고 상태 변경 
-
-    // PC에 성공 응답
-    notifyPairResult("OK:PAIR");
-
-    Serial.printf(
-      "# PAIR: 저장 완료 %02X:%02X:%02X:%02X:%02X:%02X\n", 
-      masterMac[0],
-      masterMac[1],
-      masterMac[2],
-      masterMac[3],
-      masterMac[4],
-      masterMac[5] 
-    );
+    // 3. MAC 6byte를 대기 버퍼에 복사만 해두고, 실제 NVS 저장/notify는 loop()로
+    //    미룸(위 pendingPairSave 선언부 주석 참고).
+    if (pendingPairSave || pendingPairClear) {
+      Serial.println("# PAIR: 이전 요청 처리 대기 중 — PAIR 무시");
+      return;
+    }
+    memcpy(pendingMasterMac, d + 1, 6);
+    pendingPairSave = true;
   }
 };
 
@@ -1744,8 +1732,44 @@ void loop() {
     notifyWeightsResult(weightSaveResultStr(result));     // 결과 폰에 알림
     if (result == WSAVE_OK) {
       pendingRestart = true;
-      restartAtMs = millis() + 300;  // NOTIFY 나갈 시간 확보 후 재부팅 
+      restartAtMs = millis() + 300;  // NOTIFY 나갈 시간 확보 후 재부팅
     }
+  }
+
+  // 예약된 로봇 의수 MAC 저장/삭제 처리 (PairCharCallbacks::onWrite() 참고 —
+  // NVS 쓰기를 BLE 콜백 밖 loop()로 미뤄서 WeightsCharCallbacks와 같은 이유로
+  // BLE 스택 타이밍 문제를 피함).
+  if (pendingPairSave) {
+    pendingPairSave = false;
+    memcpy(masterMac, pendingMasterMac, 6);
+
+    pairPrefs.begin("pairing", false);
+    pairPrefs.putBytes("master_mac", masterMac, 6);
+    pairPrefs.end();
+
+    hasMasterMac = true;
+
+    notifyPairResult("OK:PAIR");
+
+    Serial.printf(
+      "# PAIR: 저장 완료 %02X:%02X:%02X:%02X:%02X:%02X\n",
+      masterMac[0], masterMac[1], masterMac[2],
+      masterMac[3], masterMac[4], masterMac[5]
+    );
+  }
+
+  if (pendingPairClear) {
+    pendingPairClear = false;
+
+    pairPrefs.begin("pairing", false);
+    pairPrefs.remove("master_mac");
+    pairPrefs.end();
+
+    memset(masterMac, 0, sizeof(masterMac));
+    hasMasterMac = false;
+
+    notifyPairResult("OK:CLEAR");
+    Serial.println("# PAIR: 저장된 마스터 MAC 삭제됨");
   }
 
   static uint32_t tick = 0;
