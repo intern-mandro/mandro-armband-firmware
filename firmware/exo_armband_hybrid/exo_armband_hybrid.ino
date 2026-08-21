@@ -9,7 +9,7 @@
  * ADDS:
  *   - Circular window buffer of 128 samples x 8 channels (fed by getEMG)
  *   - Every 64 new samples (= 50% overlap), runs:
- *       preproc.process() -> nn.predict() -> argmax + 3-vote cascade
+ *       preproc.process() -> nn.predict() -> argmax + N_VOTE-vote cascade
  *   - Prints prediction on Serial alongside the BLE notify
  *
  * EVERYTHING ELSE IS UNCHANGED FROM THE RECORDER:
@@ -505,7 +505,7 @@ NeuralNet    nn;
 
 static const int N_CLASSES  = 6;
 static const int INFER_HOP  = 64;
-static const int N_VOTE     = 3;
+static const int N_VOTE     = 5;
 static const float VOTE_THRESHOLD = 0.34f;
 static const char* CLASS_NAMES[N_CLASSES] = { "rest", "flexion", "extension", "close", "supination", "pronation" };
 
@@ -516,7 +516,7 @@ static uint32_t infer_total_samples = 0;
 static uint32_t infer_samples_since_last = 0;
 
 // Vote ring
-static int vote_buf[N_VOTE] = {0, 0, 0};
+static int vote_buf[N_VOTE] = {0, 0, 0, 0, 0};
 static int vote_count = 0;
 
 // LATENCY tracking
