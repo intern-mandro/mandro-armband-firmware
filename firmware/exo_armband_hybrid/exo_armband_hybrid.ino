@@ -508,6 +508,95 @@ static const int INFER_HOP  = 64;
 static const int N_VOTE     = 5;
 static const float VOTE_THRESHOLD = 0.34f;
 static const char* CLASS_NAMES[N_CLASSES] = { "rest", "flexion", "extension", "close", "supination", "pronation" };
+static const int REST_CLASS_INDEX  = 0;  // CLASS_NAMES[REST_CLASS_INDEX] == "rest"
+static const int CLOSE_CLASS_INDEX = 3;  // CLASS_NAMES[CLOSE_CLASS_INDEX] == "close"
+
+// close는 다른 클래스보다 신호가 훨씬 큰데도 순간적인 raw NN 오분류
+// (노이즈나 애매한 프레임 하나가 하필 close로 튀는 것) 한 번에 그대로
+// 넘어가는 문제가 있었음(2026-08-21 실기기 확인, REST 디바운스 추가 후에도
+// 정확도가 떨어짐) — REST 쪽 디바운스는 "조용함"만 지켜주지 "close로
+// 넘어가는 것" 자체는 안 막았기 때문. 그래서 close는 별도로, raw_pred가
+// CLOSE_CONFIRM_FRAMES만큼 연속으로 close가 나와야만 실제로 인정하고,
+// 그 전까지는 직전에 확정됐던 값을 그대로 유지한다(= 상태를 안 바꿈).
+static int       closeStreak = 0;
+static const int CLOSE_CONFIRM_FRAMES = 3;  // 연속 3프레임(~160ms) close여야 인정
+
+// close는 원래 8채널이 대체로 다 같이 강하게 반응하는(움켜쥐는) 제스처라,
+// 진짜 close라면 평균 진폭도 커야 정상이다. CLOSE_CONFIRM_FRAMES(연속 프레임
+// 수)만으로는 "짧게 반복되는 오분류"까지는 못 잡아서, 평균 진폭이 채널별
+// floor 평균의 CLOSE_MIN_AVG_MARGIN_FACTOR배 이상일 때만 진짜로 인정하는
+// 조건을 추가함. rest가 더 자주 나오는 쪽(안전한 쪽)을 선호하기로 함
+// (2026-08-21) — 로봇손을 움켜쥐게 만드는 close 오분류가, 아무 동작 안 하는
+// rest 오분류보다 훨씬 위험하기 때문.
+static const float CLOSE_MIN_AVG_MARGIN_FACTOR = 4.0f;  // floor 평균의 4배 이상이어야 close 인정
+
+// ── REST 진폭 임계값: 채널별 연속 적응형(noise-floor tracker) ──────────
+// 채널별 진폭(추론 윈도우 내 peak-to-peak, max-min)이 "그 채널 자신의"
+// 임계값 미만인 채널만 조용하다고 보고, 8채널 전부 조용해야만(=하나라도
+// 넘으면 즉시 아님) NN 예측과 무관하게 rest로 본다. getEMG()가 이미
+// tmp = clamp(analogRead-250, 0, 255)로 baseline 근처를 걷어낸 값을 쓰기
+// 때문에, 진짜 rest에서는 대부분 0 근처에 머물고 근수축이 있으면 커진다.
+//
+// 8채널을 평균내지 않고 채널별로 따로 보는 이유: supination/pronation처럼
+// 특정 채널(CH6/7 등) 한두 개만 강하게 반응하는 제스처는, 평균을 내면
+// 나머지 조용한 채널들에 희석돼서 rest로 오판될 위험이 있음 — 안드로이드
+// 앱(RestCalibration/ClassifyViewModel)이 이미 같은 이유로 평균 대신
+// "채널 중 하나라도 활성" 방식을 쓰고 있어서 같은 방식으로 맞춤.
+//
+// 고정값 대신 채널마다 매 추론마다 계속 갱신되는 "지금까지 관측된 것 중
+// 가장 조용했던 진폭" 추정치(restFloorEstimate[ch])를 쓴다. 부착 위치/피부
+// 상태마다 rest 노이즈 수준이 달라서 고정값 하나로는 안 맞고, 부팅 직후
+// 한 번만 재는 방식은 "그 순간 아직 안 차고 있었으면" 잘못 잡히는 문제가
+// 있어서 이렇게 함 (MASTER 모드, 즉 폰 없이 로봇손 직결 상태에서도 그대로
+// 동작해야 하므로 앱 캘리브레이션에 의존하지 않음).
+//
+// 채널별로, 더 조용한 값을 관측하면 빠르게 따라 내려가고(FLOOR_DOWN_RATE),
+// 더 큰 값을 관측하면 아주 천천히만 위로 흘러가게(FLOOR_UP_RATE) 해서,
+// 오래 움직인다고 그 채널의 rest 기준이 덩달아 확 올라가버리지 않도록 함
+// — 오디오 noise-floor/squelch 추정과 같은 방식. 두 rate와
+// REST_MARGIN_FACTOR는 실측 데이터로 튜닝 필요.
+static const float FLOOR_DOWN_RATE    = 0.2f;   // 조용해질 때 하강 속도 (~5프레임 만에 수렴)
+static const float FLOOR_UP_RATE      = 0.002f; // 시끄러워질 때 상승 속도 (~수십 초 단위로 서서히)
+static const float REST_MARGIN_FACTOR = 2.0f;   // floor 대비 이 배수 미만이면 rest
+static float restFloorEstimate[N_CHANNEL] = { -1, -1, -1, -1, -1, -1, -1, -1 };  // 채널별. -1 = 아직 시드 안 됨
+
+// FLOOR_UP_RATE만으로는 부족했음(2026-08-21 실기기 확인): 사용자가 제스처를
+// "오래" 유지하면, 매 프레임 진폭이 계속 floor보다 커서 else 분기가 계속
+// 돌아 floor가 그 제스처 수준으로 서서히 끌려 올라가버림 — 즉 "동작을 rest로
+// 착각하기 시작"함. 그래서 그 채널이 직전 프레임에 이미 조용했을 때만 그
+// 채널의 floor를 갱신하도록 게이팅함 — "rest로 판정된 값만 갖고 임계값을
+// 정한다"를 실제로 구현.
+//
+// 게이트는 반드시 "채널별"로 독립이어야 함(2026-08-21 실기기에서 확인된
+// 버그: 처음엔 8채널이 final_pred==REST 하나로 묶인 공유 게이트였는데,
+// 채널 하나만 floor가 잘못 낮게 고정돼도 그 채널 때문에 8채널 전부의 게이트가
+// 안 열려서, 진짜 rest인데 계속 다른 클래스로 오판되는 현상이 있었음 —
+// 채널 하나의 문제가 나머지 7개까지 도미노로 멈추게 한 게 원인). 그래서
+// lastChannelQuiet/channelFloorLastUpdateMs를 채널마다 따로 둬서, 한 채널이
+// 고장나도 나머지는 정상적으로 계속 갱신되게 함.
+//
+// 다만 게이팅만 걸면 반대 방향 위험이 생김: floor가 어떤 이유로 비정상적으로
+// 낮게 고정되면(예: 시드 시점에 노이즈로 튄 값) 그 채널 임계값도 같이
+// 낮아져서 그 채널이 계속 "조용하지 않음"으로 걸리고, 그러면 그 채널의
+// 게이트가 영원히 안 열려서 floor가 영구히 멈춰버릴 수 있음(self-lock).
+// 채널별로 FLOOR_STALE_TIMEOUT_MS 동안 갱신이 한 번도 없었으면 그 채널만
+// 게이트를 무시하고 강제로 한 번 갱신을 허용해서 이 deadlock을 막는
+// 안전장치.
+static bool     lastChannelQuiet[N_CHANNEL] = { true, true, true, true, true, true, true, true };
+static uint32_t channelFloorLastUpdateMs[N_CHANNEL] = { 0 };
+static const uint32_t FLOOR_STALE_TIMEOUT_MS = 60000;  // 60초
+
+// 진짜 rest인데도 close 등으로 계속 왔다갔다 하는 현상(2026-08-21 실기기
+// 확인): 채널 하나가 "단 한 프레임(~53ms)"만 임계값을 넘어도 그 즉시
+// isQuiet=false가 되어버림. 근데 순간적인 전기 노이즈(케이블 흔들림, 60Hz
+// 험 등)는 한두 프레임만 반짝 튀고 사라지는 반면, 진짜 제스처는 최소
+// 수백ms는 유지됨 — 그 차이를 "넘었냐/안넘었냐"만으로는 구분 못 해서 노이즈
+// 한 방에도 그 프레임의 voted_pred가 raw NN 예측(close 등)으로 튐. 그래서
+// 채널별로 LOUD_DEBOUNCE_FRAMES 프레임 "연속으로" 넘어야만 진짜로 시끄럽다고
+// 인정하도록 디바운스를 둠 — 노이즈 스파이크는 걸러지고 진짜 제스처(더 오래
+// 유지됨)는 여전히 잡힘.
+static int      loudStreak[N_CHANNEL] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+static const int LOUD_DEBOUNCE_FRAMES = 2;  // 연속 2프레임(~106ms) 넘어야 "시끄럽다" 인정
 
 // Circular sample buffer (mirrors what BLE sends, AFTER the same -250+clamp)
 static int16_t infer_buffer[WINDOW_SIZE][N_CHANNEL];
@@ -1490,6 +1579,40 @@ static float   features[N_FEATURES];
 static float   logits[N_CLASSES];
 
 
+// 추론 윈도우(snapshot)에서 채널별 진폭(peak-to-peak)을 구한다. 8채널을
+// 평균내지 않고 chAmp[ch]에 채널별로 따로 담는다 — 위 restFloorEstimate
+// 선언부 주석 참고(평균내면 sup/pro 같은 소수 채널 제스처가 희석됨).
+// DEBUG_ADC_STATS 블록의 min/max 계산과 같은 방식이지만, 디버그 로그와
+// 무관하게 매 추론마다 rest 강제 판정에 씀.
+void computeChannelAmplitudes(int16_t win[WINDOW_SIZE][N_CHANNEL], float chAmp[N_CHANNEL]) {
+  for (int ch = 0; ch < N_CHANNEL; ch++) {
+    int mn = 999, mx = -999;
+    for (int n = 0; n < WINDOW_SIZE; n++) {
+      int v = win[n][ch];
+      if (v < mn) mn = v;
+      if (v > mx) mx = v;
+    }
+    chAmp[ch] = (float)(mx - mn);
+  }
+}
+
+
+// 채널 ch의 진폭(chAmp) 하나가 나올 때마다 그 채널의
+// restFloorEstimate[ch](noise floor)를 갱신하고, 그 시점의 rest 임계값
+// (floor * REST_MARGIN_FACTOR)을 반환한다. 더 조용한 값이면 빠르게, 더
+// 시끄러운 값이면 아주 천천히 따라간다 (위 restFloorEstimate 선언부 주석 참고).
+float updateChannelRestThreshold(int ch, float chAmp) {
+  if (restFloorEstimate[ch] < 0.0f) {
+    restFloorEstimate[ch] = chAmp;  // 첫 관측값으로 시드
+  } else if (chAmp < restFloorEstimate[ch]) {
+    restFloorEstimate[ch] += (chAmp - restFloorEstimate[ch]) * FLOOR_DOWN_RATE;
+  } else {
+    restFloorEstimate[ch] += (chAmp - restFloorEstimate[ch]) * FLOOR_UP_RATE;
+  }
+  return restFloorEstimate[ch] * REST_MARGIN_FACTOR;
+}
+
+
 void runInference() {
   // Copy circular buffer into a contiguous snapshot (oldest first)
   int start = infer_write_idx;  // oldest sample lives here (about to be overwritten)
@@ -1509,9 +1632,86 @@ void runInference() {
   int raw_pred = nn.argmax(logits, N_CLASSES);
   uint32_t t_nn = micros() - t0;
 
+  // 채널별 진폭이 각자의 (계속 갱신되는) rest 임계값 미만인 채널만 조용한
+  // 걸로 보고, 8채널 전부 조용해야만(하나라도 넘으면 즉시 아님) NN 예측과
+  // 무관하게 rest를 투표에 넣는다. 평균 대신 채널별로 따로 체크하는 이유는
+  // 위 restFloorEstimate 선언부 주석 참고(sup/pro 같은 소수 채널 제스처
+  // 희석 방지). raw_pred 대신 voted_pred를 vote_buf에 넣으므로, 다수결
+  // (getMostFrequent())의 기존 hysteresis(최근 N_VOTE개 프레임)를 그대로
+  // 활용해서 rest 판정도 한 프레임짜리 진폭 튐에 흔들리지 않고 몇 프레임에
+  // 걸쳐 안정적으로 들어오고 나간다.
+  //
+  // floor 갱신은 채널별로 독립 게이팅됨: 그 채널이 직전 프레임에 이미
+  // 조용했을 때만 그 채널의 floor를 갱신하고, 그 채널이 시끄러운 중이면
+  // 그 채널만 건너뛴다 — 그래야 오래 유지된 동작이 그 채널의 floor를
+  // 끌어올려 그 동작 자체를 rest로 착각하는 문제가 없다. 8채널을 하나의
+  // 게이트로 묶지 않는 이유는 위 lastChannelQuiet 선언부 주석 참고(채널
+  // 하나가 고장나면 전체가 도미노로 멈추는 버그가 있었음). 채널별로 너무
+  // 오래(FLOOR_STALE_TIMEOUT_MS) 갱신이 없으면 그 채널만 self-lock 방지용
+  // 강제 갱신한다.
+  float chAmp[N_CHANNEL];
+  computeChannelAmplitudes(snapshot, chAmp);
+  uint32_t nowMs = millis();
+
+  bool isQuiet = true;
+  int  loudestCh = -1;
+  float chThreshold[N_CHANNEL];
+  for (int ch = 0; ch < N_CHANNEL; ch++) {
+    bool chStale = (nowMs - channelFloorLastUpdateMs[ch]) > FLOOR_STALE_TIMEOUT_MS;
+    bool shouldUpdateCh = lastChannelQuiet[ch] || chStale;
+
+    chThreshold[ch] = shouldUpdateCh
+      ? updateChannelRestThreshold(ch, chAmp[ch])
+      : restFloorEstimate[ch] * REST_MARGIN_FACTOR;
+    if (shouldUpdateCh) channelFloorLastUpdateMs[ch] = nowMs;
+
+    // 임계값을 넘은 프레임이 LOUD_DEBOUNCE_FRAMES 연속으로 쌓여야만 진짜
+    // "시끄럽다"로 인정 — 노이즈 한 프레임짜리 스파이크에 안 흔들리게 함
+    // (위 loudStreak 선언부 주석 참고).
+    bool aboveThr = chAmp[ch] >= chThreshold[ch];
+    if (aboveThr) {
+      if (loudStreak[ch] < LOUD_DEBOUNCE_FRAMES) loudStreak[ch]++;
+    } else {
+      loudStreak[ch] = 0;
+    }
+    bool chQuiet = loudStreak[ch] < LOUD_DEBOUNCE_FRAMES;
+
+    lastChannelQuiet[ch] = chQuiet;  // 다음 프레임의 이 채널 게이트용
+    if (!chQuiet) {
+      isQuiet = false;
+      if (loudestCh < 0) loudestCh = ch;  // 디버그 로그용: 처음 걸린 채널만 기록
+    }
+  }
+
+  int candidate_pred = isQuiet ? REST_CLASS_INDEX : raw_pred;
+
+  // close는 (1) CLOSE_CONFIRM_FRAMES 연속으로 나오고, (2) 평균 진폭도 충분히
+  // 커야만(8채널 floor 평균의 CLOSE_MIN_AVG_MARGIN_FACTOR배 이상) 실제로
+  // 인정한다. 둘 중 하나라도 안 되면 직전에 확정됐던 값(vote_buf[N_VOTE-1],
+  // 이번 프레임 push 전이라 아직 "직전" 값)을 그대로 유지한다(=상태를 안
+  // 바꿈). 위 closeStreak/CLOSE_MIN_AVG_MARGIN_FACTOR 선언부 주석 참고.
+  float avgFloor = 0.0f, avgAmpNow = 0.0f;
+  for (int ch = 0; ch < N_CHANNEL; ch++) {
+    avgFloor  += restFloorEstimate[ch];
+    avgAmpNow += chAmp[ch];
+  }
+  avgFloor  /= N_CHANNEL;
+  avgAmpNow /= N_CHANNEL;
+  bool avgStrongEnough = avgAmpNow >= avgFloor * CLOSE_MIN_AVG_MARGIN_FACTOR;
+
+  if (candidate_pred == CLOSE_CLASS_INDEX) {
+    if (closeStreak < CLOSE_CONFIRM_FRAMES) closeStreak++;
+  } else {
+    closeStreak = 0;
+  }
+  bool closeConfirmed = (closeStreak >= CLOSE_CONFIRM_FRAMES) && avgStrongEnough;
+  int voted_pred = (candidate_pred == CLOSE_CLASS_INDEX && !closeConfirmed)
+    ? vote_buf[N_VOTE - 1]
+    : candidate_pred;
+
   // Vote cascade
   for (int i = 0; i < N_VOTE - 1; i++) vote_buf[i] = vote_buf[i + 1];
-  vote_buf[N_VOTE - 1] = raw_pred;
+  vote_buf[N_VOTE - 1] = voted_pred;
   if (vote_count < N_VOTE) vote_count++;
   int final_pred = getMostFrequent();
 
@@ -1531,6 +1731,21 @@ void runInference() {
       Serial.printf("ch%d:%d-%d(avg%ld) ", ch, mn, mx, sum/WINDOW_SIZE);
     }
     Serial.println();
+
+    // 채널별 진폭/floor/임계값 — REST 튜닝용 (amp=이 chThreshold 근처거나
+    // floor= 값이 이상하면 FLOOR_DOWN_RATE/FLOOR_UP_RATE/REST_MARGIN_FACTOR
+    // 조정할 것)
+    Serial.print("[REST] ");
+    for (int ch = 0; ch < N_CHANNEL; ch++) {
+      Serial.printf("ch%d:amp=%.1f,floor=%.1f,thr=%.1f ",
+                     ch, chAmp[ch], restFloorEstimate[ch], chThreshold[ch]);
+    }
+    Serial.println();
+
+    // close 확정에 쓰는 평균 진폭 — CLOSE_MIN_AVG_MARGIN_FACTOR 튜닝용
+    Serial.printf("[CLOSE] avgAmp=%.1f avgFloor=%.1f needAvg=%.1f streak=%d confirmed=%s\n",
+                   avgAmpNow, avgFloor, avgFloor * CLOSE_MIN_AVG_MARGIN_FACTOR,
+                   closeStreak, avgStrongEnough ? "Y" : "N");
   }
 
   // Per-window prediction print
@@ -1539,6 +1754,13 @@ void runInference() {
   Serial.print(CLASS_NAMES[final_pred]);
   Serial.print("  raw=");
   Serial.print(raw_pred);
+  Serial.print("  quiet=");
+  Serial.print(isQuiet ? "Y" : "N");
+  if (!isQuiet) {
+    Serial.print("(ch");
+    Serial.print(loudestCh);
+    Serial.print(")");
+  }
   Serial.print("  logits: ");
   for (int i = 0; i < N_CLASSES; i++) {
     Serial.print(logits[i], 3);
