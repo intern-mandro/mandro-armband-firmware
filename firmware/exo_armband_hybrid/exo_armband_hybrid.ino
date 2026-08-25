@@ -553,6 +553,15 @@ static const float CLOSE_MIN_AVG_MARGIN_FACTOR = 4.0f;  // floor 평균의 4배 
 static const int   CONFIRM_FRAMES_DEFAULT = 4;   // ~200ms. 실기기 실측 후 튜닝 필요
 static const float SWITCH_MARGIN = 0.3f;         // softmax 확률 단위(0~1). 0.5 → 0.3, 시작값. [HYST] 로그로 재조정 필요
 
+// extension/supination/pronation끼리 전환할 때 margin을 따로 낮추는 걸
+// 시도했었는데(0.15), 2026-08-25 실기기 확인 결과 오히려 다시 오락가락하는
+// 증상이 심해져서 되돌림 — margin을 너무 낮추면 애매한 프레임도 streak를
+// 계속 쌓게 만들어서, ROTATION_CONFIRM_FRAMES_BONUS(6프레임 요구)만으로
+// 버티던 안정성까지 깎아먹은 것으로 보임. SWITCH_MARGIN과 값을 같게 둬서
+// switchMarginFor()의 분기 자체는 남겨두되(나중에 다른 값으로 재시도할
+// 여지), 지금은 사실상 전 클래스 공통 margin으로 동작한다.
+static const float ROTATION_SWITCH_MARGIN = SWITCH_MARGIN;
+
 // 코랩 분석(2026-08 이전)에서 extension/supination/pronation 셋이 서로 자주
 // 헷갈린다고 확인됨. 그래서 이 셋끼리 전환할 때만(직전 확정값도 이 축
 // 소속일 때만) CONFIRM_FRAMES를 더 얹어서 더 까다롭게 확정한다.
@@ -561,9 +570,21 @@ static const float SWITCH_MARGIN = 0.3f;         // softmax 확률 단위(0~1). 
 // pronation이 거의 확정이 안 될 정도로 과하게 까다로워짐 — 이 셋은 원래도
 // NN 확률이 서로 가깝게 나오는 그룹이라(margin이 작게 나오기 쉬움), "진짜
 // 연속" 요구(다른 후보 뜨면 즉시 streak 리셋)와 겹치면서 7프레임을 연속으로
-// 채우는 게 사실상 거의 불가능해짐. 2로 낮춰서(6프레임) 완화. 그래도 부족하면
-// SWITCH_MARGIN 쪽도 이 그룹만 따로 낮추는 걸 다음으로 시도.
-static const int   ROTATION_CONFIRM_FRAMES_BONUS = 2;
+// 채우는 게 사실상 거의 불가능해짐. 한때 2로 낮췄었으나(6프레임), 이번엔
+// extension↔supination/pronation 전환도 더 오락가락한다는 피드백이 있어
+// 다시 3으로 올림(7프레임) — supination/pronation의 과도한 엄격함 문제는
+// 이제 아래 SUP_PRO_CONFIRM_FRAMES_BONUS로 별도 분리했으니, 이 값은
+// extension이 끼는 전환 기준으로 다시 튜닝한다.
+static const int   ROTATION_CONFIRM_FRAMES_BONUS = 3;
+
+// supination↔pronation은 rotation 계열(extension 포함 3개) 중에서도 특히
+// 자주 오락가락한다는 실기기 피드백(2026-08-25)이 있어서, 이 둘 사이
+// 전환에만 ROTATION_CONFIRM_FRAMES_BONUS 위에 추가로 더 얹는다.
+// extension↔supination/pronation은 ROTATION_CONFIRM_FRAMES_BONUS만 적용되고
+// (4+3=7프레임), supination↔pronation은 여기에 이 값까지 더해 가장
+// 엄격하다(4+3+2=9프레임). 실측 없이 정한 시작값이라 [HYST] 로그로 재조정
+// 필요.
+static const int   SUP_PRO_CONFIRM_FRAMES_BONUS = 2;
 
 // 2026-08-25 실기기 재확인: "다른 후보 뜨면 즉시 streak=0" (진짜 연속 강제)이
 // 노이즈 한 프레임에도 진행 상황을 통째로 날려버려서, 오히려 판정이 계속
@@ -574,6 +595,21 @@ static const int   ROTATION_CONFIRM_FRAMES_BONUS = 2;
 // 안 죽지만, 계속 안 맞으면 결국 0에 수렴해서 확정도 안 됨 — 다수결의
 // "비연속 허용" 약점(순서 무관 개수만 셈)까지 되돌아가진 않는다.
 static const int   STREAK_DECAY_STEP = 1;
+
+// ── REST 탈출 전용 다수결 (2026-08-25) ──────────────────────────────────
+// REST→활성 클래스 전환에서 실기기 확인 결과: 다수결+FIFO 방식이 decay
+// 히스테리시스보다 훨씬 잘 잡혔음. 이유: decay는 "맞으면 +1, 틀리면 -1"이라
+// 노이즈가 절반 가까이 섞이면(REST 탈출 초반엔 신호가 아직 안정 안 돼서
+// 흔함) 1보 전진 1보 후퇴만 반복하며 잘 안 쌓임. 다수결은 최근 N개 중 일부만
+// 맞으면 되니 이런 상황에 더 강함.
+//
+// 반면 활성 클래스끼리(flexion↔extension 등) 전환은 오분류 리스크가 더 커서
+// (제스처가 이미 진행 중인데 잘못 끊기면 더 눈에 띔) decay 히스테리시스를
+// 그대로 유지한다. 즉 "REST에서 나가는 결정"과 "활성 제스처끼리 바꾸는 결정"을
+// 다른 메커니즘으로 분리한다 — confirmed_pred==REST일 때만 아래 다수결을 쓰고,
+// 그 외에는 기존 applyHysteresis() 흐름(streak+margin+decay)을 그대로 탄다.
+static const int   REST_EXIT_VOTE_N = 5;
+static const float REST_EXIT_VOTE_THRESHOLD = 0.34f;  // ~2/5, 원래 다수결(VOTE_THRESHOLD)과 동일 기준
 
 // ── REST 진폭 임계값: 채널별 연속 적응형(noise-floor tracker) ──────────
 // 채널별 진폭(추론 윈도우 내 peak-to-peak, max-min)이 "그 채널 자신의"
@@ -660,6 +696,11 @@ static uint32_t infer_samples_since_last = 0;
 static int   confirmed_pred = REST_CLASS_INDEX;
 static int   classStreak[N_CLASSES] = {0, 0, 0, 0, 0, 0};
 static float debugLastMargin = -1.0f;  // 직전 프레임 margin. rest/close bypass면 -1(해당없음)
+
+// REST 탈출 전용 다수결 FIFO (위 REST_EXIT_VOTE_N 선언부 주석 참고).
+// -1 = 아직 채워지지 않은 슬롯.
+static int restExitVoteBuf[REST_EXIT_VOTE_N] = {-1, -1, -1, -1, -1};
+static int restExitVoteCount = 0;
 
 // LATENCY tracking
 static uint32_t infer_count = 0;
@@ -1613,25 +1654,80 @@ bool isRotationFamily(int c) {
   return c == 2 || c == 4 || c == 5;
 }
 
+// supination/pronation만 — rotation 계열 중에서도 이 둘끼리가 특히 자주
+// 오락가락한다는 실기기 피드백 반영(위 SUP_PRO_CONFIRM_FRAMES_BONUS 선언부
+// 주석 참고).
+bool isSupOrPro(int c) {
+  return c == 4 || c == 5;
+}
+
 // candidate_pred로 전환하는 데 필요한 연속 프레임 수. 직전 확정값과
-// candidate가 둘 다 rotation 계열이면(=그 축 안에서 헷갈리는 전환이면)
-// 더 까다롭게 ROTATION_CONFIRM_FRAMES_BONUS만큼 더 요구한다.
+// candidate가 둘 다 supination/pronation이면 가장 까다롭게(ROTATION +
+// SUP_PRO 보너스 둘 다), 그 외 rotation 계열끼리면(extension이 낀 전환)
+// ROTATION_CONFIRM_FRAMES_BONUS만큼만 더 요구한다.
 int confirmFramesFor(int candidate_pred) {
+  if (isSupOrPro(candidate_pred) && isSupOrPro(confirmed_pred)) {
+    return CONFIRM_FRAMES_DEFAULT + ROTATION_CONFIRM_FRAMES_BONUS + SUP_PRO_CONFIRM_FRAMES_BONUS;
+  }
   if (isRotationFamily(candidate_pred) && isRotationFamily(confirmed_pred)) {
     return CONFIRM_FRAMES_DEFAULT + ROTATION_CONFIRM_FRAMES_BONUS;
   }
   return CONFIRM_FRAMES_DEFAULT;
 }
 
+// candidate_pred로 전환하는 데 필요한 margin 기준. rotation 계열끼리
+// 전환이면 ROTATION_SWITCH_MARGIN(더 낮음)을, 아니면 SWITCH_MARGIN을 쓴다
+// (위 ROTATION_SWITCH_MARGIN 선언부 주석 참고).
+float switchMarginFor(int candidate_pred) {
+  if (isRotationFamily(candidate_pred) && isRotationFamily(confirmed_pred)) {
+    return ROTATION_SWITCH_MARGIN;
+  }
+  return SWITCH_MARGIN;
+}
+
+// REST에서 활성 클래스로 나가는 전환만 담당하는 다수결(위 REST_EXIT_VOTE_N
+// 선언부 주석 참고). candidate_pred는 항상 활성 4클래스 중 하나로만 들어온다
+// (REST/CLOSE, confirmed와 동일한 경우는 applyHysteresis()에서 이미 걸러짐).
+// 최근 REST_EXIT_VOTE_N개 중 REST_EXIT_VOTE_THRESHOLD 이상 같은 클래스가
+// 나오면 그 클래스로 즉시 확정(순서 무관, 원래 다수결과 동일한 관대함).
+// 못 채우면 REST를 그대로 유지한다.
+int applyRestExitVote(int candidate_pred) {
+  for (int i = 0; i < REST_EXIT_VOTE_N - 1; i++) restExitVoteBuf[i] = restExitVoteBuf[i + 1];
+  restExitVoteBuf[REST_EXIT_VOTE_N - 1] = candidate_pred;
+  if (restExitVoteCount < REST_EXIT_VOTE_N) restExitVoteCount++;
+
+  int counts[N_CLASSES] = {0};
+  int n_seen = (restExitVoteCount < REST_EXIT_VOTE_N) ? restExitVoteCount : REST_EXIT_VOTE_N;
+  for (int i = 0; i < n_seen; i++) {
+    int p = restExitVoteBuf[i];
+    if (p >= 0 && p < N_CLASSES) counts[p]++;
+  }
+  int best = 0, best_count = 0;
+  for (int i = 1; i < N_CLASSES; i++) {
+    if (counts[i] > best_count) { best_count = counts[i]; best = i; }
+  }
+
+  if (best_count >= REST_EXIT_VOTE_THRESHOLD * REST_EXIT_VOTE_N) {
+    confirmed_pred = best;
+    restExitVoteCount = 0;
+    for (int i = 0; i < REST_EXIT_VOTE_N; i++) restExitVoteBuf[i] = -1;
+    for (int i = 0; i < N_CLASSES; i++) classStreak[i] = 0;
+  }
+  return confirmed_pred;
+}
+
 // rest/close는 각자 전용 게이트를 이미 통과한 값만 candidate_pred로 들어오므로
 // 즉시 확정한다(위 SWITCH_MARGIN/CONFIRM_FRAMES_DEFAULT 선언부 주석 참고).
-// 나머지 4개 클래스는 candidate_pred가 CONFIRM_FRAMES만큼 "진짜 연속으로", 그리고
-// margin(top1 확률 - top2 확률, softmax 확률 차이)이 SWITCH_MARGIN 이상인
-// 프레임에서만 streak가 쌓여야 실제로 전환된다. 조건을 못 채우면
-// confirmed_pred(직전 확정값)를 그대로 반환한다 — rest/close의 "안 바뀜"과
-// 같은 철학. probs는 nn.predict()가 채운 클래스별 softmax 확률(합=1)이다 —
-// 위 SWITCH_MARGIN 선언부 주석 참고(이미 softmax된 값이라 여기서 다시
-// softmax를 적용하면 안 됨).
+// confirmed_pred가 REST인 상태에서 활성 클래스로 나가려는 전환은
+// applyRestExitVote()(다수결)로 처리하고, 그 외 활성 클래스끼리의 전환은
+// candidate_pred가 CONFIRM_FRAMES만큼 "진짜 연속으로", 그리고 margin(top1
+// 확률 - top2 확률, softmax 확률 차이)이 SWITCH_MARGIN 이상인 프레임에서만
+// streak가 쌓여야 실제로 전환된다(위 REST_EXIT_VOTE_N 선언부 주석 참고 —
+// 왜 이 둘을 다른 메커니즘으로 나눴는지). 조건을 못 채우면 confirmed_pred
+// (직전 확정값)를 그대로 반환한다 — rest/close의 "안 바뀜"과 같은 철학.
+// probs는 nn.predict()가 채운 클래스별 softmax 확률(합=1)이다 — 위
+// SWITCH_MARGIN 선언부 주석 참고(이미 softmax된 값이라 여기서 다시 softmax를
+// 적용하면 안 됨).
 //
 // "진짜 연속" 보장(2026-08-25 수정): 매 프레임 candidate_pred가 아닌 다른 모든
 // 클래스의 streak를 여기서 0으로 리셋한다 — 그래야 한 시점엔 오직 하나의
@@ -1643,6 +1739,8 @@ int applyHysteresis(int candidate_pred, float* probs) {
   if (candidate_pred == REST_CLASS_INDEX || candidate_pred == CLOSE_CLASS_INDEX) {
     confirmed_pred = candidate_pred;
     for (int i = 0; i < N_CLASSES; i++) classStreak[i] = 0;
+    restExitVoteCount = 0;
+    for (int i = 0; i < REST_EXIT_VOTE_N; i++) restExitVoteBuf[i] = -1;
     debugLastMargin = -1.0f;
     return confirmed_pred;
   }
@@ -1651,6 +1749,11 @@ int applyHysteresis(int candidate_pred, float* probs) {
     classStreak[candidate_pred] = 0;
     debugLastMargin = -1.0f;
     return confirmed_pred;
+  }
+
+  if (confirmed_pred == REST_CLASS_INDEX) {
+    debugLastMargin = -1.0f;  // 다수결 경로는 margin을 안 씀
+    return applyRestExitVote(candidate_pred);
   }
 
   for (int i = 0; i < N_CLASSES; i++) {
@@ -1667,7 +1770,7 @@ int applyHysteresis(int candidate_pred, float* probs) {
   float margin = top1 - top2;
   debugLastMargin = margin;
 
-  if (margin >= SWITCH_MARGIN) {
+  if (margin >= switchMarginFor(candidate_pred)) {
     classStreak[candidate_pred]++;
   } else {
     // 마진 부족한 프레임 하나로 스트릭을 통째로 리셋하지 않고 조금만 깎는다
@@ -1794,10 +1897,14 @@ void runInference() {
 
   // close는 (1) CLOSE_CONFIRM_FRAMES 연속으로 나오고, (2) 평균 진폭도 충분히
   // 커야만(8채널 floor 평균의 CLOSE_MIN_AVG_MARGIN_FACTOR배 이상) 실제로
-  // 인정한다. 둘 중 하나라도 안 되면 직전에 확정됐던 값(confirmed_pred, 이번
-  // 프레임의 applyHysteresis() 호출 전이라 아직 "직전" 값)을 그대로
-  // 유지한다(=상태를 안 바꿈). 위 closeStreak/CLOSE_MIN_AVG_MARGIN_FACTOR
-  // 선언부 주석 참고.
+  // 인정한다. 둘 중 하나라도 안 되면 직전 확정값을 유지하는 대신 강제로
+  // REST를 찍는다(2026-08-25 변경) — close 오분류가 로봇손을 잘못 쥐게 만드는
+  // 것보다, 일단 손을 펴는(rest) 쪽이 더 안전하다는 기존 철학(위
+  // CLOSE_MIN_AVG_MARGIN_FACTOR 선언부 주석 참고)을 한 단계 더 강하게 적용한
+  // 것. 부작용: 다른 제스처(예: flexion)를 유지하던 중 NN이 단 한 프레임만
+  // close로 잘못 튀어도(진폭은 못 채움) 그 즉시 REST로 넘어간다 — REST는
+  // applyHysteresis()에서 즉시 확정(bypass)되기 때문. 이게 너무 잦으면
+  // CLOSE_MIN_AVG_MARGIN_FACTOR를 낮추거나 이 강제 REST를 되돌려야 함.
   float avgFloor = 0.0f, avgAmpNow = 0.0f;
   for (int ch = 0; ch < N_CHANNEL; ch++) {
     avgFloor  += restFloorEstimate[ch];
@@ -1814,7 +1921,7 @@ void runInference() {
   }
   bool closeConfirmed = (closeStreak >= CLOSE_CONFIRM_FRAMES) && avgStrongEnough;
   int voted_pred = (candidate_pred == CLOSE_CLASS_INDEX && !closeConfirmed)
-    ? confirmed_pred
+    ? REST_CLASS_INDEX
     : candidate_pred;
 
   // rest/close는 위에서 이미 각자 전용 게이트를 통과한 값만 voted_pred로
@@ -1854,12 +1961,24 @@ void runInference() {
                    avgAmpNow, avgFloor, avgFloor * CLOSE_MIN_AVG_MARGIN_FACTOR,
                    closeStreak, avgStrongEnough ? "Y" : "N");
 
-    // 나머지 4개 클래스 히스테리시스 상태 — SWITCH_MARGIN/CONFIRM_FRAMES_DEFAULT/
-    // ROTATION_CONFIRM_FRAMES_BONUS 튜닝용. margin=-1이면 이번 프레임은 rest/close
-    // bypass였거나 candidate==confirmed(유지)라 margin을 계산하지 않은 것.
-    Serial.printf("[HYST] voted=%s confirmed=%s margin=%.3f streak=%d need=%d\n",
+    // 나머지 4개 클래스 히스테리시스 상태 — SWITCH_MARGIN/ROTATION_SWITCH_MARGIN/
+    // CONFIRM_FRAMES_DEFAULT/ROTATION_CONFIRM_FRAMES_BONUS 튜닝용. margin=-1이면
+    // 이번 프레임은 rest/close bypass였거나 candidate==confirmed(유지)라 margin을
+    // 계산하지 않은 것.
+    Serial.printf("[HYST] voted=%s confirmed=%s margin=%.3f needMargin=%.2f streak=%d need=%d\n",
                    CLASS_NAMES[voted_pred], CLASS_NAMES[confirmed_pred],
-                   debugLastMargin, classStreak[voted_pred], confirmFramesFor(voted_pred));
+                   debugLastMargin, switchMarginFor(voted_pred),
+                   classStreak[voted_pred], confirmFramesFor(voted_pred));
+
+    // REST 탈출 다수결 버퍼 — REST_EXIT_VOTE_N/REST_EXIT_VOTE_THRESHOLD 튜닝용.
+    // confirmed_pred가 REST가 아니면(이미 활성 클래스로 넘어간 상태) 버퍼가
+    // 안 쓰이므로 buf는 참고용으로만 찍힘.
+    Serial.print("[REST_EXIT] buf=[");
+    for (int i = 0; i < REST_EXIT_VOTE_N; i++) {
+      Serial.print(restExitVoteBuf[i] >= 0 ? CLASS_NAMES[restExitVoteBuf[i]] : "-");
+      if (i < REST_EXIT_VOTE_N - 1) Serial.print(" ");
+    }
+    Serial.printf("] count=%d confirmed=%s\n", restExitVoteCount, CLASS_NAMES[confirmed_pred]);
   }
 
   // Per-window prediction print
