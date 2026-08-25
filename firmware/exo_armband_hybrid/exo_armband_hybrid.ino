@@ -9,7 +9,8 @@
  * ADDS:
  *   - Circular window buffer of 128 samples x 8 channels (fed by getEMG)
  *   - Every 64 new samples (= 50% overlap), runs:
- *       preproc.process() -> nn.predict() -> argmax + N_VOTE-vote cascade
+ *       preproc.process() -> nn.predict() -> argmax + per-class hysteresis
+ *       (streak + softmax-probability margin gate; see applyHysteresis())
  *   - Prints prediction on Serial alongside the BLE notify
  *
  * EVERYTHING ELSE IS UNCHANGED FROM THE RECORDER:
@@ -505,8 +506,6 @@ NeuralNet    nn;
 
 static const int N_CLASSES  = 6;
 static const int INFER_HOP  = 64;
-static const int N_VOTE     = 5;
-static const float VOTE_THRESHOLD = 0.34f;
 static const char* CLASS_NAMES[N_CLASSES] = { "rest", "flexion", "extension", "close", "supination", "pronation" };
 static const int REST_CLASS_INDEX  = 0;  // CLASS_NAMES[REST_CLASS_INDEX] == "rest"
 static const int CLOSE_CLASS_INDEX = 3;  // CLASS_NAMES[CLOSE_CLASS_INDEX] == "close"
@@ -529,6 +528,42 @@ static const int CLOSE_CONFIRM_FRAMES = 3;  // 연속 3프레임(~160ms) close�
 // (2026-08-21) — 로봇손을 움켜쥐게 만드는 close 오분류가, 아무 동작 안 하는
 // rest 오분류보다 훨씬 위험하기 때문.
 static const float CLOSE_MIN_AVG_MARGIN_FACTOR = 4.0f;  // floor 평균의 4배 이상이어야 close 인정
+
+// ── 전 클래스 히스테리시스: flexion/extension/supination/pronation도 "줏대"를
+// 갖게 함 ───────────────────────────────────────────────────────────────
+// rest/close는 각각 위의 전용 게이트(채널 진폭 기반 isQuiet 디바운스, close
+// streak+진폭마진)를 이미 통과한 값만 여기로 들어오므로 즉시 확정한다.
+// 나머지 4개 클래스는 raw_pred → 5프레임 다수결(VOTE_THRESHOLD=0.34, 즉
+// 5프레임 중 2프레임만 같아도 통과)만 거쳐서 rest/close에 비해 훨씬
+// 헐렁하게 흔들리던 문제가 있었음(2026-08-25). close에 쓰던 "새 후보가
+// CONFIRM_FRAMES만큼 연속으로 나오고, 못 채우면 직전 확정값을 유지"
+// 패턴을 일반화해서 이 4개 클래스에도 적용한다. 다만 close처럼 진폭 마진을
+// 쓸 채널 신호 특성이 없으므로, 대신 top1-top2 확률 차이(margin)를 신뢰도
+// 대용으로 쓴다 — margin이 작을수록 NN이 두 클래스 사이에서 애매하게
+// 흔들리고 있다는 뜻이라 그런 프레임은 streak에 아예 안 쌓이게 한다.
+//
+// nn.predict()가 채우는 logits[] 배열은 이름과 달리 raw logit이 아니라 이미
+// softmax를 거친 클래스별 확률이다 — 마지막 dense layer의 activation이
+// MODEL_ACTIVATIONS[2]=1(=ACT_SOFTMAX, MODEL.h)이라 predict() 안에서
+// applyActivation()이 softmax까지 적용해서 반환한다(docs/FIRMWARE_PROTOCOL.md
+// "l0~l5: 각 클래스 softmax 확률"도 동일하게 설명). 그래서 applyHysteresis()의
+// margin = top1(logits) - top2(logits)는 별도 softmax 계산 없이 그 자체로
+// 이미 확률 차이(0~1 스케일)다 — margin에 softmax를 한 번 더 씌우면 이미
+// 정규화된 값을 또 눌러서 왜곡되므로 하면 안 된다.
+static const int   CONFIRM_FRAMES_DEFAULT = 4;   // ~200ms. 실기기 실측 후 튜닝 필요
+static const float SWITCH_MARGIN = 0.3f;         // softmax 확률 단위(0~1). 0.5 → 0.3, 시작값. [HYST] 로그로 재조정 필요
+
+// 코랩 분석(2026-08 이전)에서 extension/supination/pronation 셋이 서로 자주
+// 헷갈린다고 확인됨. 그래서 이 셋끼리 전환할 때만(직전 확정값도 이 축
+// 소속일 때만) CONFIRM_FRAMES를 더 얹어서 더 까다롭게 확정한다.
+//
+// 2026-08-25 실기기 확인: 3(=7프레임 연속)으로 했더니 오히려 supination/
+// pronation이 거의 확정이 안 될 정도로 과하게 까다로워짐 — 이 셋은 원래도
+// NN 확률이 서로 가깝게 나오는 그룹이라(margin이 작게 나오기 쉬움), "진짜
+// 연속" 요구(다른 후보 뜨면 즉시 streak 리셋)와 겹치면서 7프레임을 연속으로
+// 채우는 게 사실상 거의 불가능해짐. 2로 낮춰서(6프레임) 완화. 그래도 부족하면
+// SWITCH_MARGIN 쪽도 이 그룹만 따로 낮추는 걸 다음으로 시도.
+static const int   ROTATION_CONFIRM_FRAMES_BONUS = 2;
 
 // ── REST 진폭 임계값: 채널별 연속 적응형(noise-floor tracker) ──────────
 // 채널별 진폭(추론 윈도우 내 peak-to-peak, max-min)이 "그 채널 자신의"
@@ -554,10 +589,16 @@ static const float CLOSE_MIN_AVG_MARGIN_FACTOR = 4.0f;  // floor 평균의 4배 
 // 더 큰 값을 관측하면 아주 천천히만 위로 흘러가게(FLOOR_UP_RATE) 해서,
 // 오래 움직인다고 그 채널의 rest 기준이 덩달아 확 올라가버리지 않도록 함
 // — 오디오 noise-floor/squelch 추정과 같은 방식. 두 rate와
-// REST_MARGIN_FACTOR는 실측 데이터로 튜닝 필요.
+// REST_MARGIN_FACTOR는 실측 데이터로 튜닝 필요 — 2026-08-25 실측 결과 pause(잠깐
+// 멈춘 상태, floor 대비 ~2.7배)는 rest로 걸러져야 하고 supination(~6.5배)은
+// 걸리면 안 되는 걸 확인해서 2.0 → 4.0으로 올림(그 둘 사이). 한때 5.0까지
+// 올려봤으나 실기기에서 REST→활성 제스처 전환이 잘 안 되는 문제가 있어서
+// (임계값이 너무 높아 약한 제스처가 8채널 전부 조용함으로 오판됨) 4.0으로
+// 되돌림 — 4.0도 여전히 pause(2.7)보다 위, supination(6.5)보다 아래라 그
+// 둘 사이 조건은 유지하면서 다른 약한 제스처엔 여유를 더 준다.
 static const float FLOOR_DOWN_RATE    = 0.2f;   // 조용해질 때 하강 속도 (~5프레임 만에 수렴)
 static const float FLOOR_UP_RATE      = 0.002f; // 시끄러워질 때 상승 속도 (~수십 초 단위로 서서히)
-static const float REST_MARGIN_FACTOR = 2.0f;   // floor 대비 이 배수 미만이면 rest
+static const float REST_MARGIN_FACTOR = 4.0f;   // floor 대비 이 배수 미만이면 rest (pause~2.7배는 걸러내고 supination~6.5배는 안 걸리게 실측 조정, 5.0은 전환 안 되는 문제로 되돌림)
 static float restFloorEstimate[N_CHANNEL] = { -1, -1, -1, -1, -1, -1, -1, -1 };  // 채널별. -1 = 아직 시드 안 됨
 
 // FLOOR_UP_RATE만으로는 부족했음(2026-08-21 실기기 확인): 사용자가 제스처를
@@ -604,9 +645,11 @@ static int     infer_write_idx = 0;
 static uint32_t infer_total_samples = 0;
 static uint32_t infer_samples_since_last = 0;
 
-// Vote ring
-static int vote_buf[N_VOTE] = {0, 0, 0, 0, 0};
-static int vote_count = 0;
+// Hysteresis state (rest/close 제외 4개 클래스의 "전환" 확정용).
+// confirmed_pred == 직전 프레임까지 확정된 최종 예측값(= 이전의 final_pred).
+static int   confirmed_pred = REST_CLASS_INDEX;
+static int   classStreak[N_CLASSES] = {0, 0, 0, 0, 0, 0};
+static float debugLastMargin = -1.0f;  // 직전 프레임 margin. rest/close bypass면 -1(해당없음)
 
 // LATENCY tracking
 static uint32_t infer_count = 0;
@@ -1501,8 +1544,8 @@ void setup() {
     }
   }
   Serial.println("# hybrid sketch: recorder + inference 6-class");
-  Serial.printf("# inference window=%d, hop=%d, vote=%d\n",
-                WINDOW_SIZE, INFER_HOP, N_VOTE);
+  Serial.printf("# inference window=%d, hop=%d, confirmFrames=%d, switchMargin=%.2f\n",
+                WINDOW_SIZE, INFER_HOP, CONFIRM_FRAMES_DEFAULT, SWITCH_MARGIN);
 
   // NEW: load NN weights + scaler from LittleFS (local-training migration,
   // see docs/FIRMWARE_PROTOCOL.md 4-1). Inference stays disabled until a
@@ -1553,24 +1596,76 @@ int getEMG() {
 // =========================
 // NEW: Inference routine
 // =========================
-int getMostFrequent() {
-  int counts[N_CLASSES] = {0};
-  int n_seen = (vote_count < N_VOTE) ? vote_count : N_VOTE;
-  for (int i = 0; i < n_seen; i++) {
-    int p = vote_buf[i];
-    if (p >= 0 && p < N_CLASSES) counts[p]++;
+
+// extension/supination/pronation — 코랩 분석에서 서로 헷갈린다고 확인된 축.
+// (CLASS_NAMES 인덱스: 2=extension, 4=supination, 5=pronation)
+bool isRotationFamily(int c) {
+  return c == 2 || c == 4 || c == 5;
+}
+
+// candidate_pred로 전환하는 데 필요한 연속 프레임 수. 직전 확정값과
+// candidate가 둘 다 rotation 계열이면(=그 축 안에서 헷갈리는 전환이면)
+// 더 까다롭게 ROTATION_CONFIRM_FRAMES_BONUS만큼 더 요구한다.
+int confirmFramesFor(int candidate_pred) {
+  if (isRotationFamily(candidate_pred) && isRotationFamily(confirmed_pred)) {
+    return CONFIRM_FRAMES_DEFAULT + ROTATION_CONFIRM_FRAMES_BONUS;
   }
-  int best = 0, best_count = counts[0];
-  for (int i = 1; i < N_CLASSES; i++) {
-    if (counts[i] > best_count) {
-      best_count = counts[i];
-      best = i;
-    }
+  return CONFIRM_FRAMES_DEFAULT;
+}
+
+// rest/close는 각자 전용 게이트를 이미 통과한 값만 candidate_pred로 들어오므로
+// 즉시 확정한다(위 SWITCH_MARGIN/CONFIRM_FRAMES_DEFAULT 선언부 주석 참고).
+// 나머지 4개 클래스는 candidate_pred가 CONFIRM_FRAMES만큼 "진짜 연속으로", 그리고
+// margin(top1 확률 - top2 확률, softmax 확률 차이)이 SWITCH_MARGIN 이상인
+// 프레임에서만 streak가 쌓여야 실제로 전환된다. 조건을 못 채우면
+// confirmed_pred(직전 확정값)를 그대로 반환한다 — rest/close의 "안 바뀜"과
+// 같은 철학. probs는 nn.predict()가 채운 클래스별 softmax 확률(합=1)이다 —
+// 위 SWITCH_MARGIN 선언부 주석 참고(이미 softmax된 값이라 여기서 다시
+// softmax를 적용하면 안 됨).
+//
+// "진짜 연속" 보장(2026-08-25 수정): 매 프레임 candidate_pred가 아닌 다른 모든
+// 클래스의 streak를 여기서 0으로 리셋한다 — 그래야 한 시점엔 오직 하나의
+// 클래스만 streak를 쌓을 수 있다(close의 단일 closeStreak 변수와 같은 효과).
+// 이게 없으면 flexion↔extension처럼 서로 다른 클래스가 번갈아 나와도 각자
+// streak가 끊기지 않고 따로 누적돼서, 진짜 연속이 아닌데도 결국 확정돼버리는
+// 문제가 있었음.
+int applyHysteresis(int candidate_pred, float* probs) {
+  if (candidate_pred == REST_CLASS_INDEX || candidate_pred == CLOSE_CLASS_INDEX) {
+    confirmed_pred = candidate_pred;
+    for (int i = 0; i < N_CLASSES; i++) classStreak[i] = 0;
+    debugLastMargin = -1.0f;
+    return confirmed_pred;
   }
-  if (best_count < VOTE_THRESHOLD * N_VOTE) {
-    return vote_buf[(vote_count - 1) % N_VOTE];
+
+  if (candidate_pred == confirmed_pred) {
+    classStreak[candidate_pred] = 0;
+    debugLastMargin = -1.0f;
+    return confirmed_pred;
   }
-  return best;
+
+  for (int i = 0; i < N_CLASSES; i++) {
+    if (i != candidate_pred) classStreak[i] = 0;  // 다른 클래스가 뜬 적 있으면 그 클래스의 진행은 무효
+  }
+
+  float top1 = -1e9f, top2 = -1e9f;
+  for (int i = 0; i < N_CLASSES; i++) {
+    if (probs[i] > top1) { top2 = top1; top1 = probs[i]; }
+    else if (probs[i] > top2) { top2 = probs[i]; }
+  }
+  float margin = top1 - top2;
+  debugLastMargin = margin;
+
+  if (margin >= SWITCH_MARGIN) {
+    classStreak[candidate_pred]++;
+  } else {
+    classStreak[candidate_pred] = 0;  // 마진 부족하면 스트릭 리셋
+  }
+
+  if (classStreak[candidate_pred] >= confirmFramesFor(candidate_pred)) {
+    confirmed_pred = candidate_pred;
+    classStreak[candidate_pred] = 0;
+  }
+  return confirmed_pred;
 }
 
 
@@ -1634,12 +1729,11 @@ void runInference() {
 
   // 채널별 진폭이 각자의 (계속 갱신되는) rest 임계값 미만인 채널만 조용한
   // 걸로 보고, 8채널 전부 조용해야만(하나라도 넘으면 즉시 아님) NN 예측과
-  // 무관하게 rest를 투표에 넣는다. 평균 대신 채널별로 따로 체크하는 이유는
-  // 위 restFloorEstimate 선언부 주석 참고(sup/pro 같은 소수 채널 제스처
-  // 희석 방지). raw_pred 대신 voted_pred를 vote_buf에 넣으므로, 다수결
-  // (getMostFrequent())의 기존 hysteresis(최근 N_VOTE개 프레임)를 그대로
-  // 활용해서 rest 판정도 한 프레임짜리 진폭 튐에 흔들리지 않고 몇 프레임에
-  // 걸쳐 안정적으로 들어오고 나간다.
+  // 무관하게 rest를 candidate_pred로 넣는다. 평균 대신 채널별로 따로 체크하는
+  // 이유는 위 restFloorEstimate 선언부 주석 참고(sup/pro 같은 소수 채널 제스처
+  // 희석 방지). candidate_pred==REST는 아래 applyHysteresis()에서 즉시
+  // 확정되므로(위 applyHysteresis 선언부 주석 참고), rest 판정 자체는 이
+  // 채널 디바운스(LOUD_DEBOUNCE_FRAMES)가 흔들림을 막아준다.
   //
   // floor 갱신은 채널별로 독립 게이팅됨: 그 채널이 직전 프레임에 이미
   // 조용했을 때만 그 채널의 floor를 갱신하고, 그 채널이 시끄러운 중이면
@@ -1687,9 +1781,10 @@ void runInference() {
 
   // close는 (1) CLOSE_CONFIRM_FRAMES 연속으로 나오고, (2) 평균 진폭도 충분히
   // 커야만(8채널 floor 평균의 CLOSE_MIN_AVG_MARGIN_FACTOR배 이상) 실제로
-  // 인정한다. 둘 중 하나라도 안 되면 직전에 확정됐던 값(vote_buf[N_VOTE-1],
-  // 이번 프레임 push 전이라 아직 "직전" 값)을 그대로 유지한다(=상태를 안
-  // 바꿈). 위 closeStreak/CLOSE_MIN_AVG_MARGIN_FACTOR 선언부 주석 참고.
+  // 인정한다. 둘 중 하나라도 안 되면 직전에 확정됐던 값(confirmed_pred, 이번
+  // 프레임의 applyHysteresis() 호출 전이라 아직 "직전" 값)을 그대로
+  // 유지한다(=상태를 안 바꿈). 위 closeStreak/CLOSE_MIN_AVG_MARGIN_FACTOR
+  // 선언부 주석 참고.
   float avgFloor = 0.0f, avgAmpNow = 0.0f;
   for (int ch = 0; ch < N_CHANNEL; ch++) {
     avgFloor  += restFloorEstimate[ch];
@@ -1706,14 +1801,13 @@ void runInference() {
   }
   bool closeConfirmed = (closeStreak >= CLOSE_CONFIRM_FRAMES) && avgStrongEnough;
   int voted_pred = (candidate_pred == CLOSE_CLASS_INDEX && !closeConfirmed)
-    ? vote_buf[N_VOTE - 1]
+    ? confirmed_pred
     : candidate_pred;
 
-  // Vote cascade
-  for (int i = 0; i < N_VOTE - 1; i++) vote_buf[i] = vote_buf[i + 1];
-  vote_buf[N_VOTE - 1] = voted_pred;
-  if (vote_count < N_VOTE) vote_count++;
-  int final_pred = getMostFrequent();
+  // rest/close는 위에서 이미 각자 전용 게이트를 통과한 값만 voted_pred로
+  // 들어오므로 applyHysteresis() 안에서 즉시 확정되고, 나머지 4개 클래스만
+  // streak+margin 게이트를 거친다(위 applyHysteresis 선언부 주석 참고).
+  int final_pred = applyHysteresis(voted_pred, logits);
 
   // Debug ADC stats every 5 inferences
   static int adc_dbg = 0;
@@ -1746,9 +1840,22 @@ void runInference() {
     Serial.printf("[CLOSE] avgAmp=%.1f avgFloor=%.1f needAvg=%.1f streak=%d confirmed=%s\n",
                    avgAmpNow, avgFloor, avgFloor * CLOSE_MIN_AVG_MARGIN_FACTOR,
                    closeStreak, avgStrongEnough ? "Y" : "N");
+
+    // 나머지 4개 클래스 히스테리시스 상태 — SWITCH_MARGIN/CONFIRM_FRAMES_DEFAULT/
+    // ROTATION_CONFIRM_FRAMES_BONUS 튜닝용. margin=-1이면 이번 프레임은 rest/close
+    // bypass였거나 candidate==confirmed(유지)라 margin을 계산하지 않은 것.
+    Serial.printf("[HYST] voted=%s confirmed=%s margin=%.3f streak=%d need=%d\n",
+                   CLASS_NAMES[voted_pred], CLASS_NAMES[confirmed_pred],
+                   debugLastMargin, classStreak[voted_pred], confirmFramesFor(voted_pred));
   }
 
   // Per-window prediction print
+  // t=<ms>는 안정성 측정용(전환 횟수/체류시간 분석 스크립트가 파싱). 로직에는
+  // 영향 없는 순수 로깅 추가. 다수결 버전과 로그 포맷을 맞춰서 같은 분석
+  // 스크립트로 비교 가능하게 함.
+  Serial.print("t=");
+  Serial.print(millis());
+  Serial.print(" ");
   Serial.print(final_pred);
   Serial.print(" ");
   Serial.print(CLASS_NAMES[final_pred]);
