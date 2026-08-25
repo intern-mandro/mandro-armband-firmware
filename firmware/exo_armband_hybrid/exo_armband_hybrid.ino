@@ -565,6 +565,16 @@ static const float SWITCH_MARGIN = 0.3f;         // softmax 확률 단위(0~1). 
 // SWITCH_MARGIN 쪽도 이 그룹만 따로 낮추는 걸 다음으로 시도.
 static const int   ROTATION_CONFIRM_FRAMES_BONUS = 2;
 
+// 2026-08-25 실기기 재확인: "다른 후보 뜨면 즉시 streak=0" (진짜 연속 강제)이
+// 노이즈 한 프레임에도 진행 상황을 통째로 날려버려서, 오히려 판정이 계속
+// 재시도만 하다 실패하는 게 "불안정하다"는 체감으로 이어진 것으로 보임.
+// 다수결(노이즈 몇 프레임 정도는 봐줌)과 히스테리시스(그래도 전체적으로
+// 꾸준해야 확정)의 절충안: 조건 불충족 프레임이 나와도 streak를 0으로 밀지
+// 않고 STREAK_DECAY_STEP만큼만 깎는다(leaky counter). 노이즈 한두 프레임에는
+// 안 죽지만, 계속 안 맞으면 결국 0에 수렴해서 확정도 안 됨 — 다수결의
+// "비연속 허용" 약점(순서 무관 개수만 셈)까지 되돌아가진 않는다.
+static const int   STREAK_DECAY_STEP = 1;
+
 // ── REST 진폭 임계값: 채널별 연속 적응형(noise-floor tracker) ──────────
 // 채널별 진폭(추론 윈도우 내 peak-to-peak, max-min)이 "그 채널 자신의"
 // 임계값 미만인 채널만 조용하다고 보고, 8채널 전부 조용해야만(=하나라도
@@ -1644,7 +1654,9 @@ int applyHysteresis(int candidate_pred, float* probs) {
   }
 
   for (int i = 0; i < N_CLASSES; i++) {
-    if (i != candidate_pred) classStreak[i] = 0;  // 다른 클래스가 뜬 적 있으면 그 클래스의 진행은 무효
+    // 다른 클래스가 후보로 뜬 프레임 하나로 그 클래스의 진행을 통째로 날리지
+    // 않고 STREAK_DECAY_STEP만큼만 깎는다(leaky counter, 위 선언부 주석 참고).
+    if (i != candidate_pred) classStreak[i] = max(0, classStreak[i] - STREAK_DECAY_STEP);
   }
 
   float top1 = -1e9f, top2 = -1e9f;
@@ -1658,7 +1670,8 @@ int applyHysteresis(int candidate_pred, float* probs) {
   if (margin >= SWITCH_MARGIN) {
     classStreak[candidate_pred]++;
   } else {
-    classStreak[candidate_pred] = 0;  // 마진 부족하면 스트릭 리셋
+    // 마진 부족한 프레임 하나로 스트릭을 통째로 리셋하지 않고 조금만 깎는다
+    classStreak[candidate_pred] = max(0, classStreak[candidate_pred] - STREAK_DECAY_STEP);
   }
 
   if (classStreak[candidate_pred] >= confirmFramesFor(candidate_pred)) {
