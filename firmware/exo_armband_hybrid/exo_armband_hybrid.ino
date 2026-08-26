@@ -510,24 +510,17 @@ static const char* CLASS_NAMES[N_CLASSES] = { "rest", "flexion", "extension", "c
 static const int REST_CLASS_INDEX  = 0;  // CLASS_NAMES[REST_CLASS_INDEX] == "rest"
 static const int CLOSE_CLASS_INDEX = 3;  // CLASS_NAMES[CLOSE_CLASS_INDEX] == "close"
 
-// close는 다른 클래스보다 신호가 훨씬 큰데도 순간적인 raw NN 오분류
-// (노이즈나 애매한 프레임 하나가 하필 close로 튀는 것) 한 번에 그대로
-// 넘어가는 문제가 있었음(2026-08-21 실기기 확인, REST 디바운스 추가 후에도
-// 정확도가 떨어짐) — REST 쪽 디바운스는 "조용함"만 지켜주지 "close로
-// 넘어가는 것" 자체는 안 막았기 때문. 그래서 close는 별도로, raw_pred가
-// CLOSE_CONFIRM_FRAMES만큼 연속으로 close가 나와야만 실제로 인정하고,
-// 그 전까지는 직전에 확정됐던 값을 그대로 유지한다(= 상태를 안 바꿈).
-static int       closeStreak = 0;
-static const int CLOSE_CONFIRM_FRAMES = 3;  // 연속 3프레임(~160ms) close여야 인정
-
-// close는 원래 8채널이 대체로 다 같이 강하게 반응하는(움켜쥐는) 제스처라,
-// 진짜 close라면 평균 진폭도 커야 정상이다. CLOSE_CONFIRM_FRAMES(연속 프레임
-// 수)만으로는 "짧게 반복되는 오분류"까지는 못 잡아서, 평균 진폭이 채널별
-// floor 평균의 CLOSE_MIN_AVG_MARGIN_FACTOR배 이상일 때만 진짜로 인정하는
-// 조건을 추가함. rest가 더 자주 나오는 쪽(안전한 쪽)을 선호하기로 함
-// (2026-08-21) — 로봇손을 움켜쥐게 만드는 close 오분류가, 아무 동작 안 하는
-// rest 오분류보다 훨씬 위험하기 때문.
-static const float CLOSE_MIN_AVG_MARGIN_FACTOR = 4.0f;  // floor 평균의 4배 이상이어야 close 인정
+// close 전용 게이트(CLOSE_CONFIRM_FRAMES 연속 + 평균진폭 조건, 실패시 강제
+// REST)는 2026-08-26에 제거함. close와 다른 활성 클래스 간 feature 상관관계가
+// 최대 0.59로 확인돼, 별도 진폭 게이트 없이 flexion/extension/supination/
+// pronation과 동일하게 applyHysteresis()의 margin+streak 디바운스만으로
+// 처리하기로 함(아래 applyHysteresis() 선언부 주석 참고).
+//
+// 주의(안전 트레이드오프): 기존 게이트는 "close 오분류가 로봇손을 잘못 쥐게
+// 만드는 게 rest 오분류보다 위험하다"는 판단으로 일부러 넣었던 안전장치였다.
+// 제거하면 다른 활성 클래스와 완전히 동일한 취급을 받는 대신, close로의
+// 오확정을 막아주던 별도의 방어선이 사라진다 — 실기기에서 오히려 close
+// 오탐이 늘면 이 커밋을 되돌리는 것도 고려할 것.
 
 // ── 전 클래스 히스테리시스: flexion/extension/supination/pronation도 "줏대"를
 // 갖게 함 ───────────────────────────────────────────────────────────────
@@ -596,20 +589,13 @@ static const int   SUP_PRO_CONFIRM_FRAMES_BONUS = 2;
 // "비연속 허용" 약점(순서 무관 개수만 셈)까지 되돌아가진 않는다.
 static const int   STREAK_DECAY_STEP = 1;
 
-// ── REST 탈출 전용 다수결 (2026-08-25) ──────────────────────────────────
-// REST→활성 클래스 전환에서 실기기 확인 결과: 다수결+FIFO 방식이 decay
-// 히스테리시스보다 훨씬 잘 잡혔음. 이유: decay는 "맞으면 +1, 틀리면 -1"이라
-// 노이즈가 절반 가까이 섞이면(REST 탈출 초반엔 신호가 아직 안정 안 돼서
-// 흔함) 1보 전진 1보 후퇴만 반복하며 잘 안 쌓임. 다수결은 최근 N개 중 일부만
-// 맞으면 되니 이런 상황에 더 강함.
-//
-// 반면 활성 클래스끼리(flexion↔extension 등) 전환은 오분류 리스크가 더 커서
-// (제스처가 이미 진행 중인데 잘못 끊기면 더 눈에 띔) decay 히스테리시스를
-// 그대로 유지한다. 즉 "REST에서 나가는 결정"과 "활성 제스처끼리 바꾸는 결정"을
-// 다른 메커니즘으로 분리한다 — confirmed_pred==REST일 때만 아래 다수결을 쓰고,
-// 그 외에는 기존 applyHysteresis() 흐름(streak+margin+decay)을 그대로 탄다.
-static const int   REST_EXIT_VOTE_N = 5;
-static const float REST_EXIT_VOTE_THRESHOLD = 0.34f;  // ~2/5, 원래 다수결(VOTE_THRESHOLD)과 동일 기준
+// REST 탈출 전용 다수결(applyRestExitVote(), REST_EXIT_VOTE_N/THRESHOLD)은
+// 2026-08-26에 제거함 — "전적으로 디바운스 방식" 통일 요청에 따라, REST→활성
+// 클래스 전환도 나머지 전환들과 동일하게 아래 applyHysteresis()의
+// margin+leaky-decay streak 메커니즘 하나로 처리한다. (참고: 이 다수결은
+// 애초에 decay 히스테리시스가 REST 탈출 초반의 높은 노이즈 비중에 약하다는
+// 실기기 관찰 때문에 도입됐던 것이라, 다시 통합하면 그 문제가 재발할 수
+// 있음 — [HYST] 로그로 REST 탈출 구간의 margin/streak 분포를 재확인할 것.)
 
 // ── REST 진폭 임계값: 채널별 연속 적응형(noise-floor tracker) ──────────
 // 채널별 진폭(추론 윈도우 내 peak-to-peak, max-min)이 "그 채널 자신의"
@@ -697,10 +683,17 @@ static int   confirmed_pred = REST_CLASS_INDEX;
 static int   classStreak[N_CLASSES] = {0, 0, 0, 0, 0, 0};
 static float debugLastMargin = -1.0f;  // 직전 프레임 margin. rest/close bypass면 -1(해당없음)
 
-// REST 탈출 전용 다수결 FIFO (위 REST_EXIT_VOTE_N 선언부 주석 참고).
-// -1 = 아직 채워지지 않은 슬롯.
-static int restExitVoteBuf[REST_EXIT_VOTE_N] = {-1, -1, -1, -1, -1};
-static int restExitVoteCount = 0;
+// 히스테리시스가 유발하는 지연을 실측하기 위한 타임스탬프(2026-08-26 추가).
+// classStreak[i]가 0에서 다시 쌓이기 시작하는 순간(=이 클래스로의 "새 시도"가
+// 시작된 순간)의 millis()를 기록해둔다. 실제로 확정되는 순간
+// (applyHysteresis() 안의 [HYST_CONFIRM] 로그 참고) millis() - streakStartMs[i]를
+// 계산하면 "그 전환이 실제로 몇 ms 걸렸는지"를 알 수 있고, 이걸
+// confirmFramesFor(i) * (추론 주기)의 이론값과 비교하면 노이즈로 인한 재시도
+// 때문에 추가로 늘어난 지연(=히스테리시스 자체가 유발한 지연)을 분리해서 볼 수
+// 있다. 데이터가 늦게 들어오는 게 이 후보정 로직 때문인지, 아니면 아래
+// LATENCY 트래킹(추론 주기/전처리/NN 연산 시간)처럼 원래부터 있던 파이프라인
+// 지연인지 구분하는 용도.
+static uint32_t streakStartMs[N_CLASSES] = {0, 0, 0, 0, 0, 0};
 
 // LATENCY tracking
 static uint32_t infer_count = 0;
@@ -709,12 +702,20 @@ static uint32_t t_preproc_max = 0, t_nn_max = 0;
 static int      infer_latency_count = 0;
 static const int N_TIMING_INF = 20;
 
+// runInference() 호출 간 실제 간격(ms) — INFER_HOP/SAMPLING_FREQ 기준 이론값
+// (~53ms)과 비교해서 "추론 루프 자체가 원래 밀리고 있는지"(=히스테리시스와
+// 무관한 구조적 지연)를 확인하는 용도. 전처리/NN 연산이 한 주기보다 오래
+// 걸리면 이 값이 이론값보다 커진다.
+static uint32_t lastInferStartMs   = 0;
+static uint32_t interInferGapSum   = 0;
+static uint32_t interInferGapMax   = 0;
+
 // 디버그 출력 스위치 (1로 바꾸면 켜짐). 이전엔 `if (false & <조건>)` 형태로
 // 껐는데, `&`가 `==`/`>=`보다 우선순위가 낮아서 실제로는 `false & (조건)`이
 // 아니라 컴파일러 경고 없이 항상 거짓인 죽은 코드였다. 의도를 명시적으로
 // 드러내려고 상수 플래그로 바꿨다 (0이면 최적화 단계에서 통째로 빠진다).
 #define DEBUG_ADC_STATS      1
-#define DEBUG_INFER_LATENCY  0
+#define DEBUG_INFER_LATENCY  1
 
 // 모드 전환 (슬레이브 ↔ 마스터)
 enum ArmbandMode { MODE_SLAVE, MODE_MASTER };
@@ -1685,62 +1686,35 @@ float switchMarginFor(int candidate_pred) {
   return SWITCH_MARGIN;
 }
 
-// REST에서 활성 클래스로 나가는 전환만 담당하는 다수결(위 REST_EXIT_VOTE_N
-// 선언부 주석 참고). candidate_pred는 항상 활성 4클래스 중 하나로만 들어온다
-// (REST/CLOSE, confirmed와 동일한 경우는 applyHysteresis()에서 이미 걸러짐).
-// 최근 REST_EXIT_VOTE_N개 중 REST_EXIT_VOTE_THRESHOLD 이상 같은 클래스가
-// 나오면 그 클래스로 즉시 확정(순서 무관, 원래 다수결과 동일한 관대함).
-// 못 채우면 REST를 그대로 유지한다.
-int applyRestExitVote(int candidate_pred) {
-  for (int i = 0; i < REST_EXIT_VOTE_N - 1; i++) restExitVoteBuf[i] = restExitVoteBuf[i + 1];
-  restExitVoteBuf[REST_EXIT_VOTE_N - 1] = candidate_pred;
-  if (restExitVoteCount < REST_EXIT_VOTE_N) restExitVoteCount++;
-
-  int counts[N_CLASSES] = {0};
-  int n_seen = (restExitVoteCount < REST_EXIT_VOTE_N) ? restExitVoteCount : REST_EXIT_VOTE_N;
-  for (int i = 0; i < n_seen; i++) {
-    int p = restExitVoteBuf[i];
-    if (p >= 0 && p < N_CLASSES) counts[p]++;
-  }
-  int best = 0, best_count = 0;
-  for (int i = 1; i < N_CLASSES; i++) {
-    if (counts[i] > best_count) { best_count = counts[i]; best = i; }
-  }
-
-  if (best_count >= REST_EXIT_VOTE_THRESHOLD * REST_EXIT_VOTE_N) {
-    confirmed_pred = best;
-    restExitVoteCount = 0;
-    for (int i = 0; i < REST_EXIT_VOTE_N; i++) restExitVoteBuf[i] = -1;
-    for (int i = 0; i < N_CLASSES; i++) classStreak[i] = 0;
-  }
-  return confirmed_pred;
-}
-
-// rest/close는 각자 전용 게이트를 이미 통과한 값만 candidate_pred로 들어오므로
-// 즉시 확정한다(위 SWITCH_MARGIN/CONFIRM_FRAMES_DEFAULT 선언부 주석 참고).
-// confirmed_pred가 REST인 상태에서 활성 클래스로 나가려는 전환은
-// applyRestExitVote()(다수결)로 처리하고, 그 외 활성 클래스끼리의 전환은
+// close를 포함한 활성 5클래스(flexion/extension/close/supination/pronation)
+// 모두 동일한 margin+leaky-decay streak 디바운스 하나로 처리한다(2026-08-26
+// 변경 — close 전용 진폭 게이트와 REST 탈출 전용 다수결을 제거하고 "전적으로
+// 디바운스 방식"으로 통일. 근거: close와 다른 클래스 간 feature 상관관계가
+// 최대 0.59로 확인돼 별도 취급이 필요할 만큼 겹치지 않는다고 판단).
+//
+// REST만 예외로 즉시 확정한다. 이유는 다른 5클래스와 근본적으로 다르다: REST는
+// 채널 진폭 게이트(isQuiet)가 raw_pred를 덮어써서 강제로 만든 값이라, 여기서
+// margin(top1-top2)을 계산해도 그건 "그 프레임에 NN이 실제로 1등으로 예측한
+// 클래스"의 확신도이지 REST 자체의 확신도가 아니다 — REST에 margin 기반
+// 디바운스를 적용할 논리적 근거가 없다. candidate_pred가 REST가 아니면
+// raw_pred(=NN argmax)가 그대로 들어오므로, 아래 margin 계산이 candidate_pred
+// 자신에 대한 확신도로 정확히 대응된다.
+//
 // candidate_pred가 CONFIRM_FRAMES만큼 "진짜 연속으로", 그리고 margin(top1
 // 확률 - top2 확률, softmax 확률 차이)이 SWITCH_MARGIN 이상인 프레임에서만
-// streak가 쌓여야 실제로 전환된다(위 REST_EXIT_VOTE_N 선언부 주석 참고 —
-// 왜 이 둘을 다른 메커니즘으로 나눴는지). 조건을 못 채우면 confirmed_pred
-// (직전 확정값)를 그대로 반환한다 — rest/close의 "안 바뀜"과 같은 철학.
-// probs는 nn.predict()가 채운 클래스별 softmax 확률(합=1)이다 — 위
-// SWITCH_MARGIN 선언부 주석 참고(이미 softmax된 값이라 여기서 다시 softmax를
-// 적용하면 안 됨).
+// streak가 쌓여야 실제로 전환된다. 조건을 못 채우면 confirmed_pred(직전
+// 확정값)를 그대로 반환한다. probs는 nn.predict()가 채운 클래스별 softmax
+// 확률(합=1)이다 — 위 SWITCH_MARGIN 선언부 주석 참고(이미 softmax된 값이라
+// 여기서 다시 softmax를 적용하면 안 됨).
 //
 // "진짜 연속" 보장(2026-08-25 수정): 매 프레임 candidate_pred가 아닌 다른 모든
 // 클래스의 streak를 여기서 0으로 리셋한다 — 그래야 한 시점엔 오직 하나의
-// 클래스만 streak를 쌓을 수 있다(close의 단일 closeStreak 변수와 같은 효과).
-// 이게 없으면 flexion↔extension처럼 서로 다른 클래스가 번갈아 나와도 각자
-// streak가 끊기지 않고 따로 누적돼서, 진짜 연속이 아닌데도 결국 확정돼버리는
-// 문제가 있었음.
+// 클래스만 streak를 쌓을 수 있다. 다만 STREAK_DECAY_STEP만큼만 깎는 leaky
+// counter라 노이즈 한 프레임에 전체 진행이 날아가지는 않는다.
 int applyHysteresis(int candidate_pred, float* probs) {
-  if (candidate_pred == REST_CLASS_INDEX || candidate_pred == CLOSE_CLASS_INDEX) {
+  if (candidate_pred == REST_CLASS_INDEX) {
     confirmed_pred = candidate_pred;
     for (int i = 0; i < N_CLASSES; i++) classStreak[i] = 0;
-    restExitVoteCount = 0;
-    for (int i = 0; i < REST_EXIT_VOTE_N; i++) restExitVoteBuf[i] = -1;
     debugLastMargin = -1.0f;
     return confirmed_pred;
   }
@@ -1749,11 +1723,6 @@ int applyHysteresis(int candidate_pred, float* probs) {
     classStreak[candidate_pred] = 0;
     debugLastMargin = -1.0f;
     return confirmed_pred;
-  }
-
-  if (confirmed_pred == REST_CLASS_INDEX) {
-    debugLastMargin = -1.0f;  // 다수결 경로는 margin을 안 씀
-    return applyRestExitVote(candidate_pred);
   }
 
   for (int i = 0; i < N_CLASSES; i++) {
@@ -1771,6 +1740,11 @@ int applyHysteresis(int candidate_pred, float* probs) {
   debugLastMargin = margin;
 
   if (margin >= switchMarginFor(candidate_pred)) {
+    // streak가 0에서 다시 쌓이기 시작하는 순간 = 이 클래스로의 "새 시도"가
+    // 시작된 시각. 노이즈로 몇 번 실패하다 여기서 다시 0을 찍고 재시작하면
+    // 이 시각도 그만큼 다시 갱신된다 — 그래서 최종 elapsedMs가 이론값보다
+    // 커진다면 그게 곧 "노이즈로 인한 재시도가 유발한 추가 지연"이다.
+    if (classStreak[candidate_pred] == 0) streakStartMs[candidate_pred] = millis();
     classStreak[candidate_pred]++;
   } else {
     // 마진 부족한 프레임 하나로 스트릭을 통째로 리셋하지 않고 조금만 깎는다
@@ -1778,6 +1752,19 @@ int applyHysteresis(int candidate_pred, float* probs) {
   }
 
   if (classStreak[candidate_pred] >= confirmFramesFor(candidate_pred)) {
+    // 히스테리시스만으로 인한 지연을 실측: streakStartMs부터 지금까지 걸린
+    // 실제 ms와, 노이즈가 전혀 없었을 때의 이론값(필요 프레임수 × 추론 주기)을
+    // 같이 찍는다. 두 값이 비슷하면 "그냥 히스테리시스 최소 대기시간"이고,
+    // 실측값이 훨씬 크면 중간에 재시도(노이즈)가 있었다는 뜻 — 즉 지연의
+    // 원인이 히스테리시스 파라미터(CONFIRM_FRAMES_DEFAULT 등) 자체인지,
+    // 아니면 신호 품질(노이즈로 인한 재시도)인지 이 로그로 구분할 수 있다.
+    int    framesNeeded  = confirmFramesFor(candidate_pred);
+    uint32_t elapsedMs   = millis() - streakStartMs[candidate_pred];
+    float  expectedMs    = framesNeeded * (INFER_HOP * 1000.0f / SAMPLING_FREQ);
+    Serial.printf("[HYST_CONFIRM] %s -> %s framesNeeded=%d elapsedMs=%lu expectedMs=%.0f extraMs=%.0f\n",
+                  CLASS_NAMES[confirmed_pred], CLASS_NAMES[candidate_pred],
+                  framesNeeded, (unsigned long)elapsedMs, expectedMs,
+                  (float)elapsedMs - expectedMs);
     confirmed_pred = candidate_pred;
     classStreak[candidate_pred] = 0;
   }
@@ -1825,6 +1812,18 @@ float updateChannelRestThreshold(int ch, float chAmp) {
 
 
 void runInference() {
+  // 추론 루프 자체의 실제 호출 간격 측정 — INFER_HOP/SAMPLING_FREQ 기준
+  // 이론값(~53ms)보다 크게 벌어지면, 그건 히스테리시스와 무관하게 전처리/NN
+  // 연산이나 다른 코드가 루프를 밀리게 만들고 있다는 뜻(원래부터 있던 구조적
+  // 지연). 아래 LATENCY 로그에서 gapMs로 확인.
+  uint32_t nowMsEntry = millis();
+  if (lastInferStartMs != 0) {
+    uint32_t gapMs = nowMsEntry - lastInferStartMs;
+    interInferGapSum += gapMs;
+    if (gapMs > interInferGapMax) interInferGapMax = gapMs;
+  }
+  lastInferStartMs = nowMsEntry;
+
   // Copy circular buffer into a contiguous snapshot (oldest first)
   int start = infer_write_idx;  // oldest sample lives here (about to be overwritten)
   for (int i = 0; i < WINDOW_SIZE; i++) {
@@ -1895,38 +1894,17 @@ void runInference() {
 
   int candidate_pred = isQuiet ? REST_CLASS_INDEX : raw_pred;
 
-  // close는 (1) CLOSE_CONFIRM_FRAMES 연속으로 나오고, (2) 평균 진폭도 충분히
-  // 커야만(8채널 floor 평균의 CLOSE_MIN_AVG_MARGIN_FACTOR배 이상) 실제로
-  // 인정한다. 둘 중 하나라도 안 되면 직전 확정값을 유지하는 대신 강제로
-  // REST를 찍는다(2026-08-25 변경) — close 오분류가 로봇손을 잘못 쥐게 만드는
-  // 것보다, 일단 손을 펴는(rest) 쪽이 더 안전하다는 기존 철학(위
-  // CLOSE_MIN_AVG_MARGIN_FACTOR 선언부 주석 참고)을 한 단계 더 강하게 적용한
-  // 것. 부작용: 다른 제스처(예: flexion)를 유지하던 중 NN이 단 한 프레임만
-  // close로 잘못 튀어도(진폭은 못 채움) 그 즉시 REST로 넘어간다 — REST는
-  // applyHysteresis()에서 즉시 확정(bypass)되기 때문. 이게 너무 잦으면
-  // CLOSE_MIN_AVG_MARGIN_FACTOR를 낮추거나 이 강제 REST를 되돌려야 함.
-  float avgFloor = 0.0f, avgAmpNow = 0.0f;
-  for (int ch = 0; ch < N_CHANNEL; ch++) {
-    avgFloor  += restFloorEstimate[ch];
-    avgAmpNow += chAmp[ch];
-  }
-  avgFloor  /= N_CHANNEL;
-  avgAmpNow /= N_CHANNEL;
-  bool avgStrongEnough = avgAmpNow >= avgFloor * CLOSE_MIN_AVG_MARGIN_FACTOR;
+  // close 전용 게이트(CLOSE_CONFIRM_FRAMES 연속 + 평균진폭 조건, 실패시 강제
+  // REST)는 2026-08-26에 제거함 — close도 이제 flexion/extension/supination/
+  // pronation과 완전히 동일하게 취급된다. voted_pred는 항상 candidate_pred와
+  // 같지만, 아래 applyHysteresis() 호출부와 로그 코드를 최소 변경으로 유지하기
+  // 위해 이름은 그대로 둔다.
+  int voted_pred = candidate_pred;
 
-  if (candidate_pred == CLOSE_CLASS_INDEX) {
-    if (closeStreak < CLOSE_CONFIRM_FRAMES) closeStreak++;
-  } else {
-    closeStreak = 0;
-  }
-  bool closeConfirmed = (closeStreak >= CLOSE_CONFIRM_FRAMES) && avgStrongEnough;
-  int voted_pred = (candidate_pred == CLOSE_CLASS_INDEX && !closeConfirmed)
-    ? REST_CLASS_INDEX
-    : candidate_pred;
-
-  // rest/close는 위에서 이미 각자 전용 게이트를 통과한 값만 voted_pred로
-  // 들어오므로 applyHysteresis() 안에서 즉시 확정되고, 나머지 4개 클래스만
-  // streak+margin 게이트를 거친다(위 applyHysteresis 선언부 주석 참고).
+  // rest는 위에서 이미 채널 진폭 게이트를 통과한 값만 candidate_pred로
+  // 들어오므로 applyHysteresis() 안에서 즉시 확정되고, 나머지 5개 클래스
+  // (close 포함)는 streak+margin 게이트를 거친다(위 applyHysteresis
+  // 선언부 주석 참고).
   int final_pred = applyHysteresis(voted_pred, logits);
 
   // Debug ADC stats every 5 inferences
@@ -1956,29 +1934,14 @@ void runInference() {
     }
     Serial.println();
 
-    // close 확정에 쓰는 평균 진폭 — CLOSE_MIN_AVG_MARGIN_FACTOR 튜닝용
-    Serial.printf("[CLOSE] avgAmp=%.1f avgFloor=%.1f needAvg=%.1f streak=%d confirmed=%s\n",
-                   avgAmpNow, avgFloor, avgFloor * CLOSE_MIN_AVG_MARGIN_FACTOR,
-                   closeStreak, avgStrongEnough ? "Y" : "N");
-
-    // 나머지 4개 클래스 히스테리시스 상태 — SWITCH_MARGIN/ROTATION_SWITCH_MARGIN/
-    // CONFIRM_FRAMES_DEFAULT/ROTATION_CONFIRM_FRAMES_BONUS 튜닝용. margin=-1이면
-    // 이번 프레임은 rest/close bypass였거나 candidate==confirmed(유지)라 margin을
-    // 계산하지 않은 것.
+    // 활성 5클래스(close 포함) 히스테리시스 상태 — SWITCH_MARGIN/
+    // ROTATION_SWITCH_MARGIN/CONFIRM_FRAMES_DEFAULT/ROTATION_CONFIRM_FRAMES_BONUS
+    // 튜닝용. margin=-1이면 이번 프레임은 rest bypass였거나
+    // candidate==confirmed(유지)라 margin을 계산하지 않은 것.
     Serial.printf("[HYST] voted=%s confirmed=%s margin=%.3f needMargin=%.2f streak=%d need=%d\n",
                    CLASS_NAMES[voted_pred], CLASS_NAMES[confirmed_pred],
                    debugLastMargin, switchMarginFor(voted_pred),
                    classStreak[voted_pred], confirmFramesFor(voted_pred));
-
-    // REST 탈출 다수결 버퍼 — REST_EXIT_VOTE_N/REST_EXIT_VOTE_THRESHOLD 튜닝용.
-    // confirmed_pred가 REST가 아니면(이미 활성 클래스로 넘어간 상태) 버퍼가
-    // 안 쓰이므로 buf는 참고용으로만 찍힘.
-    Serial.print("[REST_EXIT] buf=[");
-    for (int i = 0; i < REST_EXIT_VOTE_N; i++) {
-      Serial.print(restExitVoteBuf[i] >= 0 ? CLASS_NAMES[restExitVoteBuf[i]] : "-");
-      if (i < REST_EXIT_VOTE_N - 1) Serial.print(" ");
-    }
-    Serial.printf("] count=%d confirmed=%s\n", restExitVoteCount, CLASS_NAMES[confirmed_pred]);
   }
 
   // Per-window prediction print
@@ -2066,8 +2029,22 @@ void runInference() {
     Serial.print(t_preproc_max);
     Serial.print(" nn=");
     Serial.println(t_nn_max);
+
+    // gapMs = runInference() 실제 호출 간격(ms). 이론값(기대 주기)과 비교해서
+    // "원래부터 있던 지연"인지 확인하는 용도 — 히스테리시스와는 무관하다.
+    // 이론값보다 mean/max가 크게 벌어지면 전처리+NN 연산(위 preproc/nn us)이나
+    // BLE/직렬 등 다른 코드가 추론 루프 자체를 밀리게 만들고 있다는 뜻.
+    float expectedGapMs = INFER_HOP * 1000.0f / SAMPLING_FREQ;
+    Serial.printf("LATENCY ms [%d inf] | gap: mean=%lu max=%lu expected=%.1f (히스테리시스와 무관한 구조적 지연 확인용)\n",
+                  infer_latency_count,
+                  (unsigned long)(interInferGapSum / infer_latency_count),
+                  (unsigned long)interInferGapMax,
+                  expectedGapMs);
+
     t_preproc_sum = t_nn_sum = 0;
     t_preproc_max = t_nn_max = 0;
+    interInferGapSum = 0;
+    interInferGapMax = 0;
     infer_latency_count = 0;
   }
 }
