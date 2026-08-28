@@ -566,18 +566,39 @@ static const float ROTATION_SWITCH_MARGIN = SWITCH_MARGIN;
 // 채우는 게 사실상 거의 불가능해짐. 한때 2로 낮췄었으나(6프레임), 이번엔
 // extension↔supination/pronation 전환도 더 오락가락한다는 피드백이 있어
 // 다시 3으로 올림(7프레임) — supination/pronation의 과도한 엄격함 문제는
-// 이제 아래 SUP_PRO_CONFIRM_FRAMES_BONUS로 별도 분리했으니, 이 값은
-// extension이 끼는 전환 기준으로 다시 튜닝한다.
+// 이제 아래 SUP_PRO_VOTE_STEP/SUP_PRO_CONFIRM_SCORE 다수결로 완전히
+// 분리했으니(2026-08-26, 이 쌍은 아예 confirmFramesFor()를 안 탐), 이 값은
+// extension이 끼는 전환 기준으로만 튜닝한다.
 static const int   ROTATION_CONFIRM_FRAMES_BONUS = 3;
 
-// supination↔pronation은 rotation 계열(extension 포함 3개) 중에서도 특히
-// 자주 오락가락한다는 실기기 피드백(2026-08-25)이 있어서, 이 둘 사이
-// 전환에만 ROTATION_CONFIRM_FRAMES_BONUS 위에 추가로 더 얹는다.
-// extension↔supination/pronation은 ROTATION_CONFIRM_FRAMES_BONUS만 적용되고
-// (4+3=7프레임), supination↔pronation은 여기에 이 값까지 더해 가장
-// 엄격하다(4+3+2=9프레임). 실측 없이 정한 시작값이라 [HYST] 로그로 재조정
-// 필요.
-static const int   SUP_PRO_CONFIRM_FRAMES_BONUS = 2;
+// supination↔pronation 전용 다수결(2026-08-26 도입) — margin+streak
+// 히스테리시스 대신 이 쌍만 별도 메커니즘을 쓴다. 이유: 이 둘은 서로가 서로의
+// top2가 되는 경우가 대부분이라 margin(top1-top2) 자체가 구조적으로 작게
+// 나온다. ROTATION_SWITCH_MARGIN을 낮춰서 완화하려던 시도(위 선언부 주석
+// 참고, 0.15로 낮췄다가 되돌림)도 이미 실패했고, 이전엔 SUP_PRO_CONFIRM_
+// FRAMES_BONUS로 "9프레임 연속" 요구까지 얹어서 오히려 가장 헷갈리는 쌍한테
+// 가장 빡빡한 두 조건(작은 margin + 많은 프레임)을 동시에 건 상태였다.
+// 다수결은 margin 개념이 없고(순서 무관하게 최근 N개 중 일부만 맞으면 됨),
+// REST 탈출 다수결이 비슷한 이유(노이즈 비중 높은 구간)로 이미 효과를 봤던
+// 방식이라 이 쌍에도 적용한다. isSupOrPro(candidate)&&isSupOrPro(confirmed)
+// 일 때만(=supination<->pronation 전환 시도일 때만) applySupProVote()로
+// 분기하고, confirmFramesFor()/switchMarginFor()의 sup/pro 전용 분기는
+// 이제 안 쓰이므로 제거했다(extension이 낀 rotation 전환용 분기는 유지).
+//
+// 2026-08-26 재설계: 처음엔 "최근 N개 FIFO 중 과반"(SUP_PRO_VOTE_N=7,
+// SUP_PRO_VOTE_THRESHOLD=0.34) 방식으로 짰는데, 이러면 confirmed가 이미
+// supination/pronation인 상태에서 extension 같은 무관한 후보가 몇 초간
+// 끼어들어도 FIFO가 전혀 안 건드려져서(그 시도는 다수결 함수 자체를 안
+// 타니까) 오래전에 쌓인 표가 시간이 한참 지난 뒤에도 그대로 살아남아 최신
+// 판정에 섞여 들어가는 문제가 있었다(추세가 바뀌었는데 낡은 증거가 여전히
+// 힘을 갖는 셈). 그래서 FIFO+개수 방식 대신, 클래스별 leaky score로
+// 바꿨다 — classStreak의 leaky decay와 같은 철학: 새 증거가 들어오면 오르고,
+// 반대쪽이나 무관한 후보가 나오면 서서히 깎인다. 하드 리셋이 아니라 leaky라
+// 노이즈 한 프레임에 안 죽고, 동시에 "관련 없는 시도가 계속되면 오래된 점수도
+// 결국 사그라든다"는 시간 개념이 자연스럽게 생긴다.
+static const int SUP_PRO_VOTE_STEP       = 1;  // 후보로 뽑힐 때마다 그 클래스 점수 증가량
+static const int SUP_PRO_VOTE_DECAY_STEP = 1;  // 반대쪽이거나 무관한 후보일 때 깎이는 양(양쪽 다 STREAK_DECAY_STEP과 동일 값으로 시작)
+static const int SUP_PRO_CONFIRM_SCORE   = 3;  // 이 점수에 도달하면 확정 (기존 FIFO N=7/threshold 0.34일 때의 "3표 필요"와 동일한 기준으로 시작)
 
 // 2026-08-25 실기기 재확인: "다른 후보 뜨면 즉시 streak=0" (진짜 연속 강제)이
 // 노이즈 한 프레임에도 진행 상황을 통째로 날려버려서, 오히려 판정이 계속
@@ -682,6 +703,13 @@ static uint32_t infer_samples_since_last = 0;
 static int   confirmed_pred = REST_CLASS_INDEX;
 static int   classStreak[N_CLASSES] = {0, 0, 0, 0, 0, 0};
 static float debugLastMargin = -1.0f;  // 직전 프레임 margin. rest/close bypass면 -1(해당없음)
+
+// supination<->pronation 전용 leaky vote score (위 SUP_PRO_VOTE_STEP 선언부
+// 주석 참고 — FIFO+개수 방식에서 leaky score 방식으로 재설계함, 2026-08-26).
+// supProScore[4](supination)/[5](pronation) 두 칸만 실제로 쓰인다. confirmed_
+// pred가 supination/pronation 중 하나가 아니게 되면 매 프레임 0으로
+// 리셋된다(applyHysteresis() 맨 앞 가드 참고).
+static int supProScore[N_CLASSES] = {0, 0, 0, 0, 0, 0};
 
 // 히스테리시스가 유발하는 지연을 실측하기 위한 타임스탬프(2026-08-26 추가).
 // classStreak[i]가 0에서 다시 쌓이기 시작하는 순간(=이 클래스로의 "새 시도"가
@@ -1656,20 +1684,17 @@ bool isRotationFamily(int c) {
 }
 
 // supination/pronation만 — rotation 계열 중에서도 이 둘끼리가 특히 자주
-// 오락가락한다는 실기기 피드백 반영(위 SUP_PRO_CONFIRM_FRAMES_BONUS 선언부
-// 주석 참고).
+// 오락가락한다는 실기기 피드백 반영. 이 둘 사이의 전환은 confirmFramesFor()가
+// 아니라 다수결(applySupProVote(), 아래 SUP_PRO_VOTE_STEP 선언부 주석 참고)로
+// 처리된다.
 bool isSupOrPro(int c) {
   return c == 4 || c == 5;
 }
 
-// candidate_pred로 전환하는 데 필요한 연속 프레임 수. 직전 확정값과
-// candidate가 둘 다 supination/pronation이면 가장 까다롭게(ROTATION +
-// SUP_PRO 보너스 둘 다), 그 외 rotation 계열끼리면(extension이 낀 전환)
-// ROTATION_CONFIRM_FRAMES_BONUS만큼만 더 요구한다.
+// candidate_pred로 전환하는 데 필요한 연속 프레임 수. supination<->pronation
+// 전환은 이제 이 함수를 안 타고 applySupProVote()(다수결)로 빠지므로, 여기
+// 남은 건 rotation 계열끼리(extension이 낀 전환)만 더 까다롭게 보는 분기뿐.
 int confirmFramesFor(int candidate_pred) {
-  if (isSupOrPro(candidate_pred) && isSupOrPro(confirmed_pred)) {
-    return CONFIRM_FRAMES_DEFAULT + ROTATION_CONFIRM_FRAMES_BONUS + SUP_PRO_CONFIRM_FRAMES_BONUS;
-  }
   if (isRotationFamily(candidate_pred) && isRotationFamily(confirmed_pred)) {
     return CONFIRM_FRAMES_DEFAULT + ROTATION_CONFIRM_FRAMES_BONUS;
   }
@@ -1686,13 +1711,37 @@ float switchMarginFor(int candidate_pred) {
   return SWITCH_MARGIN;
 }
 
-// close를 포함한 활성 5클래스(flexion/extension/close/supination/pronation)
-// 모두 동일한 margin+leaky-decay streak 디바운스 하나로 처리한다(2026-08-26
-// 변경 — close 전용 진폭 게이트와 REST 탈출 전용 다수결을 제거하고 "전적으로
-// 디바운스 방식"으로 통일. 근거: close와 다른 클래스 간 feature 상관관계가
-// 최대 0.59로 확인돼 별도 취급이 필요할 만큼 겹치지 않는다고 판단).
+// supination<->pronation 전환 전용 leaky-decay 다수결(위 SUP_PRO_VOTE_STEP
+// 선언부 주석 참고 — FIFO+개수 방식은 무관한 후보(extension 등)가 오래
+// 끼어들어도 낡은 표가 그대로 살아남는 문제가 있어서 재설계함).
+// candidate_pred는 항상 supination 또는 pronation 중 하나로만 들어온다
+// (isSupOrPro(candidate)&&isSupOrPro(confirmed)일 때만 호출되므로).
+// 후보로 뽑힌 클래스는 점수가 오르고, 반대쪽은 깎인다 — classStreak와 같은
+// leaky decay라 노이즈 한 프레임에 안 죽는다. SUP_PRO_CONFIRM_SCORE에
+// 도달하면 확정, 못 채우면 직전 confirmed_pred를 그대로 유지한다.
+int applySupProVote(int candidate_pred) {
+  int other = (candidate_pred == 4) ? 5 : 4;  // 4=supination, 5=pronation
+  supProScore[candidate_pred] += SUP_PRO_VOTE_STEP;
+  supProScore[other] = max(0, supProScore[other] - SUP_PRO_VOTE_DECAY_STEP);
+
+  if (supProScore[candidate_pred] >= SUP_PRO_CONFIRM_SCORE) {
+    confirmed_pred = candidate_pred;
+    supProScore[4] = 0;
+    supProScore[5] = 0;
+    for (int i = 0; i < N_CLASSES; i++) classStreak[i] = 0;
+  }
+  return confirmed_pred;
+}
+
+// close를 포함한 활성 클래스 전환은 margin+leaky-decay streak 디바운스 하나로
+// 처리한다(2026-08-26 변경 — close 전용 진폭 게이트와 REST 탈출 전용 다수결을
+// 제거하고 "전적으로 디바운스 방식"으로 통일. 근거: close와 다른 클래스 간
+// feature 상관관계가 최대 0.59로 확인돼 별도 취급이 필요할 만큼 겹치지 않는다고
+// 판단). 다만 supination<->pronation 전환만은 다시 다수결로 뺐다(위
+// applySupProVote() 선언부 주석 참고) — 이 쌍은 margin이 구조적으로 작을
+// 수밖에 없어서 margin 기반 히스테리시스가 원천적으로 불리하기 때문.
 //
-// REST만 예외로 즉시 확정한다. 이유는 다른 5클래스와 근본적으로 다르다: REST는
+// REST만 즉시 확정하는 이유는 다른 클래스들과 근본적으로 다르다: REST는
 // 채널 진폭 게이트(isQuiet)가 raw_pred를 덮어써서 강제로 만든 값이라, 여기서
 // margin(top1-top2)을 계산해도 그건 "그 프레임에 NN이 실제로 1등으로 예측한
 // 클래스"의 확신도이지 REST 자체의 확신도가 아니다 — REST에 margin 기반
@@ -1712,11 +1761,44 @@ float switchMarginFor(int candidate_pred) {
 // 클래스만 streak를 쌓을 수 있다. 다만 STREAK_DECAY_STEP만큼만 깎는 leaky
 // counter라 노이즈 한 프레임에 전체 진행이 날아가지는 않는다.
 int applyHysteresis(int candidate_pred, float* probs) {
+  // supProScore는 confirmed_pred가 supination/pronation 중 하나일 때만
+  // 의미가 있다 — 그 외 상태로 완전히 벗어나면 0으로 리셋해서, 예전에
+  // 시도하다 만 전환의 흔적이 한참 뒤의 무관한 시도에 섞여 들어가지 않게 한다.
+  if (!isSupOrPro(confirmed_pred)) {
+    supProScore[4] = 0;
+    supProScore[5] = 0;
+  }
+
   if (candidate_pred == REST_CLASS_INDEX) {
     confirmed_pred = candidate_pred;
     for (int i = 0; i < N_CLASSES; i++) classStreak[i] = 0;
     debugLastMargin = -1.0f;
     return confirmed_pred;
+  }
+
+  // confirmed가 이미 supination/pronation인데 candidate가 그 둘도 아니고
+  // REST도 아닌 제3의 클래스(주로 extension)면, sup/pro 입장에서는 "새로운
+  // 증거가 없는 프레임"이다. 이때 supProScore를 그대로 안 두면(예전 FIFO
+  // 방식의 문제) 몇 초 전에 쌓인 점수가 지금 상황과 무관하게 남아있다가 나중에
+  // 갑자기 확정에 기여해버린다 — 그래서 여기서 leaky하게 조금 깎아준다
+  // (2026-08-26, 사용자 피드백 반영). candidate_pred 자체(예: extension)는
+  // return 없이 아래로 흘려보내서 일반 히스테리시스를 정상적으로 탄다.
+  if (isSupOrPro(confirmed_pred) && !isSupOrPro(candidate_pred)) {
+    supProScore[4] = max(0, supProScore[4] - SUP_PRO_VOTE_DECAY_STEP);
+    supProScore[5] = max(0, supProScore[5] - SUP_PRO_VOTE_DECAY_STEP);
+  }
+
+  // supination<->pronation 쌍은 "같다/다르다" 구분 없이 항상 다수결로
+  // 처리한다(위 applySupProVote() 선언부 주석 참고) — margin 기반
+  // 히스테리시스를 아예 안 탄다. 반드시 아래 "candidate==confirmed" 분기보다
+  // 먼저 검사해야 한다: candidate==confirmed인 "동의" 프레임을 그 분기에서
+  // 먼저 걸러버리면 투표함에는 "반대"표만 쌓이게 되고, 그러면 진짜 과반이
+  // 아니라 "반대가 2번만 나와도 뒤집히는" 구조가 돼버린다(2026-08-26 실기기
+  // 확인 — sup/pro가 이전보다 더 심하게 오락가락함). 동의 프레임도 점수에
+  // 반영해야 "최근 흐름상 다수"라는 이름에 걸맞은 진짜 다수결이 된다.
+  if (isSupOrPro(candidate_pred) && isSupOrPro(confirmed_pred)) {
+    debugLastMargin = -1.0f;  // 다수결 경로는 margin을 안 씀
+    return applySupProVote(candidate_pred);
   }
 
   if (candidate_pred == confirmed_pred) {
@@ -1934,14 +2016,23 @@ void runInference() {
     }
     Serial.println();
 
-    // 활성 5클래스(close 포함) 히스테리시스 상태 — SWITCH_MARGIN/
-    // ROTATION_SWITCH_MARGIN/CONFIRM_FRAMES_DEFAULT/ROTATION_CONFIRM_FRAMES_BONUS
-    // 튜닝용. margin=-1이면 이번 프레임은 rest bypass였거나
-    // candidate==confirmed(유지)라 margin을 계산하지 않은 것.
+    // 활성 클래스 히스테리시스 상태 — SWITCH_MARGIN/ROTATION_SWITCH_MARGIN/
+    // CONFIRM_FRAMES_DEFAULT/ROTATION_CONFIRM_FRAMES_BONUS 튜닝용. margin=-1이면
+    // 이번 프레임은 rest bypass였거나 candidate==confirmed(유지)였거나
+    // supination<->pronation 다수결 경로(아래 [SUP_PRO_VOTE] 참고)였다는 뜻 —
+    // 이 셋 다 margin을 계산 안 함.
     Serial.printf("[HYST] voted=%s confirmed=%s margin=%.3f needMargin=%.2f streak=%d need=%d\n",
                    CLASS_NAMES[voted_pred], CLASS_NAMES[confirmed_pred],
                    debugLastMargin, switchMarginFor(voted_pred),
                    classStreak[voted_pred], confirmFramesFor(voted_pred));
+
+    // supination<->pronation leaky vote 점수 — SUP_PRO_VOTE_STEP/DECAY_STEP/
+    // SUP_PRO_CONFIRM_SCORE 튜닝용. confirmed_pred가 supination/pronation
+    // 중 하나가 아니면(다른 클래스로 이미 넘어간 상태) 매 프레임 0으로
+    // 리셋되므로 참고용으로만 찍힘.
+    Serial.printf("[SUP_PRO_VOTE] sup=%d pro=%d need=%d confirmed=%s\n",
+                   supProScore[4], supProScore[5],
+                   SUP_PRO_CONFIRM_SCORE, CLASS_NAMES[confirmed_pred]);
   }
 
   // Per-window prediction print
