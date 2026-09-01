@@ -658,6 +658,14 @@ static const int   STREAK_DECAY_STEP = 1;
 static const float FLOOR_DOWN_RATE    = 0.2f;   // 조용해질 때 하강 속도 (~5프레임 만에 수렴)
 static const float FLOOR_UP_RATE      = 0.01f;  // 시끄러워질 때 상승 속도 (2026-08-28: 0.002→0.01로 인상, REST 반응성 강화 목적 — FLOOR_MAX 상한 없이 올린 것이라 self-lock 재발 위험 있음, 실기기 검증 필요)
 static const float REST_MARGIN_FACTOR = 3.0f;   // floor 대비 이 배수 미만이면 rest (2026-08-28: 4.5로 올렸다가 close/sup 같은 약한 제스처가 문턱을 못 넘는 부작용이 실기기에서 확인돼 4.0으로 되돌림 — pause(2.7)~supination(6.5) 사이 절충값. 2026-08-31: t-SNE 분석(팔 고정·약한 힘 데이터셋에서 sup/pro·약한 extension이 rest 구름에 잠김)으로 4.0→3.5→3.3→3.0으로 단계 인하 — 약한 제스처의 REST→활성 전환 여유 확보 목적. pause(2.7)와의 여유가 3.0/2.7≈1.11배까지 좁아져서 잠깐 멈춤이 활성으로 샐 위험이 큼 — 실기기에서 pause 시 [REST] quiet=Y 유지되는지 반드시 확인하고, 새면 3.3~3.5로 되돌릴 것)
+// NN raw_pred가 supination/pronation일 때만 쓰는 더 낮은 문턱. sup/pro는 t-SNE상
+// rest 구름에 특히 깊이 잠겨서(다른 클래스보다 약한 표면 신호) 기본 문턱으로는
+// 약한 sup/pro가 계속 rest로 삼켜진다. raw_pred가 이미 sup/pro일 때로 한정해서
+// 그 두 클래스의 REST 탈출 여유만 넓힌다.
+// 주의(트레이드오프): 이 값이 pause(~2.7×)보다 낮으면, 잠깐 멈춘 상태에서 NN이
+// 우연히 sup/pro를 argmax할 때 그 pause가 sup/pro로 샐 수 있다. 실기기에서
+// pause 시 [REST] amp/thr 비교로 반드시 재확인하고, 새면 2.7~3.0으로 올릴 것.
+static const float REST_MARGIN_FACTOR_ROTATION = 1.5f;
 static float restFloorEstimate[N_CHANNEL] = { -1, -1, -1, -1, -1, -1, -1, -1 };  // 채널별. -1 = 아직 시드 안 됨
 
 // floor 하한선(2026-08-28) — floor가 0(또는 그 근처)까지 내려가면
@@ -1924,9 +1932,12 @@ void computeRestAmplitudes(int16_t win[WINDOW_SIZE][N_CHANNEL], float chAmp[N_CH
 
 // 채널 ch의 진폭(chAmp) 하나가 나올 때마다 그 채널의
 // restFloorEstimate[ch](noise floor)를 갱신하고, 그 시점의 rest 임계값
-// (floor * REST_MARGIN_FACTOR)을 반환한다. 더 조용한 값이면 빠르게, 더
+// (floor * marginFactor)을 반환한다. 더 조용한 값이면 빠르게, 더
 // 시끄러운 값이면 아주 천천히 따라간다 (위 restFloorEstimate 선언부 주석 참고).
-float updateChannelRestThreshold(int ch, float chAmp) {
+// marginFactor는 호출부에서 raw_pred에 따라 골라 넘긴다(sup/pro면 더 낮은 값).
+// floor 갱신 자체는 marginFactor와 무관하므로 클래스별로 문턱만 달라지고
+// noise-floor tracker는 오염되지 않는다.
+float updateChannelRestThreshold(int ch, float chAmp, float marginFactor) {
   if (restFloorEstimate[ch] < 0.0f) {
     restFloorEstimate[ch] = chAmp;  // 첫 관측값으로 시드
   } else if (chAmp < restFloorEstimate[ch]) {
@@ -1936,7 +1947,7 @@ float updateChannelRestThreshold(int ch, float chAmp) {
   }
   // 시드값이든 갱신값이든 상관없이 하한선 적용 — 위 FLOOR_MIN 선언부 주석 참고.
   if (restFloorEstimate[ch] < FLOOR_MIN) restFloorEstimate[ch] = FLOOR_MIN;
-  return restFloorEstimate[ch] * REST_MARGIN_FACTOR;
+  return restFloorEstimate[ch] * marginFactor;
 }
 
 
@@ -1994,13 +2005,18 @@ void runInference() {
   bool isQuiet = true;
   int  loudestCh = -1;
   float chThreshold[N_CHANNEL];
+  // NN이 이번 프레임에 sup/pro를 1등으로 봤으면 rest 문턱을 낮춰서 약한 sup/pro가
+  // rest로 삼켜지지 않게 한다. 그 외 클래스(및 pause처럼 raw_pred가 sup/pro가
+  // 아닌 경우)는 기본 문턱 그대로.
+  const float restFactor = isSupOrPro(raw_pred) ? REST_MARGIN_FACTOR_ROTATION
+                                                : REST_MARGIN_FACTOR;
   for (int ch = 0; ch < N_CHANNEL; ch++) {
     bool chStale = (nowMs - channelFloorLastUpdateMs[ch]) > FLOOR_STALE_TIMEOUT_MS;
     bool shouldUpdateCh = lastChannelQuiet[ch] || chStale;
 
     chThreshold[ch] = shouldUpdateCh
-      ? updateChannelRestThreshold(ch, chAmp[ch])
-      : restFloorEstimate[ch] * REST_MARGIN_FACTOR;
+      ? updateChannelRestThreshold(ch, chAmp[ch], restFactor)
+      : restFloorEstimate[ch] * restFactor;
     if (shouldUpdateCh) channelFloorLastUpdateMs[ch] = nowMs;
 
     // 임계값을 넘은 프레임이 LOUD_DEBOUNCE_FRAMES 연속으로 쌓여야만 진짜
@@ -2055,8 +2071,9 @@ void runInference() {
 
     // 채널별 진폭/floor/임계값 — REST 튜닝용 (amp=이 chThreshold 근처거나
     // floor= 값이 이상하면 FLOOR_DOWN_RATE/FLOOR_UP_RATE/REST_MARGIN_FACTOR
-    // 조정할 것)
-    Serial.print("[REST] ");
+    // 조정할 것). factor= 는 이번 프레임에 쓴 배수 (raw_pred가 sup/pro면
+    // REST_MARGIN_FACTOR_ROTATION, 아니면 REST_MARGIN_FACTOR).
+    Serial.printf("[REST] factor=%.2f ", restFactor);
     for (int ch = 0; ch < N_CHANNEL; ch++) {
       Serial.printf("ch%d:amp=%.1f,floor=%.1f,thr=%.1f ",
                      ch, chAmp[ch], restFloorEstimate[ch], chThreshold[ch]);
