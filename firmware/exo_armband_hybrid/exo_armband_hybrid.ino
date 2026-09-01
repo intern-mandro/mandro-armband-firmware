@@ -654,6 +654,22 @@ static const float FLOOR_UP_RATE      = 0.002f; // 시끄러워질 때 상승 �
 static const float REST_MARGIN_FACTOR = 4.0f;   // floor 대비 이 배수 미만이면 rest (pause~2.7배는 걸러내고 supination~6.5배는 안 걸리게 실측 조정, 5.0은 전환 안 되는 문제로 되돌림)
 static float restFloorEstimate[N_CHANNEL] = { -1, -1, -1, -1, -1, -1, -1, -1 };  // 채널별. -1 = 아직 시드 안 됨
 
+// floor 하한선(2026-08-28) — floor가 0(또는 그 근처)까지 내려가면
+// threshold(=floor×REST_MARGIN_FACTOR)도 0에 가까워져서, chAmp>=threshold가
+// 진폭이 진짜 0이어도 항상 참이 되는 수학적 함정이 있다 — 그러면 그 채널은
+// 진짜로 조용해도 영원히 "시끄럽다"로만 판정돼서 REST 자체가 막혀버린다.
+//
+// 2026-08-28 실측(라벨링된 REST/제스처 데이터로 FLOOR_MIN별 오분류율 시뮬레이션,
+// 64샘플 윈도우 기준): 원래 값 1.0에서는 REST→ACTIVE 오류율이 ~100%에 달함
+// (진짜 REST 상황을 거의 항상 "활성 중"으로 오판) — 반면 제스처→REST 오류율은
+// ~0%. 시뮬레이션상 FLOOR_MIN=4가 절충값으로 보였으나, 실기기에서 sup 동작이
+// 계속 REST로 삼켜지는 문제가 확인됨 — sup에 결정적인 채널의 원래 floor가
+// FLOOR_MIN보다 낮아서, 하한이 그 채널 threshold를 원래보다 과하게 밀어올린
+// 것으로 추정(채널마다 floor 자연값이 다른데 FLOOR_MIN은 전 채널 공통이라
+// 생기는 부작용). 3으로 낮췄다가 그래도 부족해서 2로 재조정 — 이 값도
+// 실기기 재검증 필요.
+static const float FLOOR_MIN = 2.0f;
+
 // REST 게이트 전용 진폭 계산 창 크기(2026-08-28) — NN의 WINDOW_SIZE(128, 모델
 // 입력 shape에 고정돼 재학습 없인 못 건드림)와는 완전히 별개다. computeRestAmplitudes()는
 // NN 파이프라인(preproc.process()/nn.predict())과 전혀 무관한 순수 peak-to-peak
@@ -1912,6 +1928,8 @@ float updateChannelRestThreshold(int ch, float chAmp) {
   } else {
     restFloorEstimate[ch] += (chAmp - restFloorEstimate[ch]) * FLOOR_UP_RATE;
   }
+  // 시드값이든 갱신값이든 상관없이 하한선 적용 — 위 FLOOR_MIN 선언부 주석 참고.
+  if (restFloorEstimate[ch] < FLOOR_MIN) restFloorEstimate[ch] = FLOOR_MIN;
   return restFloorEstimate[ch] * REST_MARGIN_FACTOR;
 }
 
