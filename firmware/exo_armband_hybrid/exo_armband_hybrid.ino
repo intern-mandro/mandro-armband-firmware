@@ -649,9 +649,15 @@ static const int   STREAK_DECAY_STEP = 1;
 // (임계값이 너무 높아 약한 제스처가 8채널 전부 조용함으로 오판됨) 4.0으로
 // 되돌림 — 4.0도 여전히 pause(2.7)보다 위, supination(6.5)보다 아래라 그
 // 둘 사이 조건은 유지하면서 다른 약한 제스처엔 여유를 더 준다.
+//
+// 2026-08-28: sup/pro→rest 복귀가 너무 느리다는 실사용 피드백으로 4.0→4.5로
+// 소폭 인상. 5.0(실패 이력)보다는 훨씬 작은 폭이라 pause(2.7)/supination(6.5)
+// 사이 여유 안에 여전히 들어가지만, 다른 약한 제스처가 REST로 오판될 위험이
+// 이론상 남아있다 — 실기기에서 다른 제스처들(flexion/extension/close)의
+// REST→활성 전환이 여전히 잘 되는지 반드시 재확인할 것.
 static const float FLOOR_DOWN_RATE    = 0.2f;   // 조용해질 때 하강 속도 (~5프레임 만에 수렴)
-static const float FLOOR_UP_RATE      = 0.002f; // 시끄러워질 때 상승 속도 (~수십 초 단위로 서서히)
-static const float REST_MARGIN_FACTOR = 4.0f;   // floor 대비 이 배수 미만이면 rest (pause~2.7배는 걸러내고 supination~6.5배는 안 걸리게 실측 조정, 5.0은 전환 안 되는 문제로 되돌림)
+static const float FLOOR_UP_RATE      = 0.01f;  // 시끄러워질 때 상승 속도 (2026-08-28: 0.002→0.01로 인상, REST 반응성 강화 목적 — FLOOR_MAX 상한 없이 올린 것이라 self-lock 재발 위험 있음, 실기기 검증 필요)
+static const float REST_MARGIN_FACTOR = 3.0f;   // floor 대비 이 배수 미만이면 rest (2026-08-28: 4.5로 올렸다가 close/sup 같은 약한 제스처가 문턱을 못 넘는 부작용이 실기기에서 확인돼 4.0으로 되돌림 — pause(2.7)~supination(6.5) 사이 절충값. 2026-08-31: t-SNE 분석(팔 고정·약한 힘 데이터셋에서 sup/pro·약한 extension이 rest 구름에 잠김)으로 4.0→3.5→3.3→3.0으로 단계 인하 — 약한 제스처의 REST→활성 전환 여유 확보 목적. pause(2.7)와의 여유가 3.0/2.7≈1.11배까지 좁아져서 잠깐 멈춤이 활성으로 샐 위험이 큼 — 실기기에서 pause 시 [REST] quiet=Y 유지되는지 반드시 확인하고, 새면 3.3~3.5로 되돌릴 것)
 static float restFloorEstimate[N_CHANNEL] = { -1, -1, -1, -1, -1, -1, -1, -1 };  // 채널별. -1 = 아직 시드 안 됨
 
 // floor 하한선(2026-08-28) — floor가 0(또는 그 근처)까지 내려가면
