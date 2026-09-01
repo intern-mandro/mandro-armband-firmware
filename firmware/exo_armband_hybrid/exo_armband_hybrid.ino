@@ -654,6 +654,18 @@ static const float FLOOR_UP_RATE      = 0.002f; // 시끄러워질 때 상승 �
 static const float REST_MARGIN_FACTOR = 4.0f;   // floor 대비 이 배수 미만이면 rest (pause~2.7배는 걸러내고 supination~6.5배는 안 걸리게 실측 조정, 5.0은 전환 안 되는 문제로 되돌림)
 static float restFloorEstimate[N_CHANNEL] = { -1, -1, -1, -1, -1, -1, -1, -1 };  // 채널별. -1 = 아직 시드 안 됨
 
+// REST 게이트 전용 진폭 계산 창 크기(2026-08-28) — NN의 WINDOW_SIZE(128, 모델
+// 입력 shape에 고정돼 재학습 없인 못 건드림)와는 완전히 별개다. computeRestAmplitudes()는
+// NN 파이프라인(preproc.process()/nn.predict())과 전혀 무관한 순수 peak-to-peak
+// 계산이라 몇 샘플을 볼지 자유롭게 좁힐 수 있다. 128 전체를 보면 힘을 푼
+// 직후에도 옛 활성 신호가 최대 2 hop(~100ms)까지 윈도우에 남아있어 REST
+// 판정이 그만큼 늦어졌는데, 최근 64개(≈50ms, INFER_HOP과 동일)만 보면 그
+// 잔재가 훨씬 빨리 빠져나가 REST가 더 일찍 잡힌다. NN 입력(raw_pred)은
+// 여전히 128개 전체를 그대로 쓰므로 flexion/extension/close/sup/pro 분류
+// 자체는 전혀 안 바뀐다. 64는 실측 없이 정한 시작값 — 너무 줄이면
+// peak-to-peak 추정이 노이즈에 더 민감해지므로 [REST] 로그로 재조정 필요.
+static const int REST_AMP_WINDOW_SAMPLES = 64;
+
 // FLOOR_UP_RATE만으로는 부족했음(2026-08-21 실기기 확인): 사용자가 제스처를
 // "오래" 유지하면, 매 프레임 진폭이 계속 floor보다 커서 else 분기가 계속
 // 돌아 floor가 그 제스처 수준으로 서서히 끌려 올라가버림 — 즉 "동작을 rest로
@@ -1859,15 +1871,26 @@ static float   features[N_FEATURES];
 static float   logits[N_CLASSES];
 
 
-// 추론 윈도우(snapshot)에서 채널별 진폭(peak-to-peak)을 구한다. 8채널을
-// 평균내지 않고 chAmp[ch]에 채널별로 따로 담는다 — 위 restFloorEstimate
-// 선언부 주석 참고(평균내면 sup/pro 같은 소수 채널 제스처가 희석됨).
-// DEBUG_ADC_STATS 블록의 min/max 계산과 같은 방식이지만, 디버그 로그와
-// 무관하게 매 추론마다 rest 강제 판정에 씀.
-void computeChannelAmplitudes(int16_t win[WINDOW_SIZE][N_CHANNEL], float chAmp[N_CHANNEL]) {
+// REST 게이트 전용 진폭(peak-to-peak) 계산 — snapshot 128개 전체가 아니라
+// 최근 REST_AMP_WINDOW_SAMPLES(64)개만 본다(위 선언부 주석 참고). snapshot은
+// oldest-first로 채워지므로(runInference()의 스냅샷 구성부 — infer_write_idx가
+// 가리키는 가장 오래된 샘플부터 선형화) 최신 샘플은 항상 배열 끝쪽에 있다 —
+// 그래서 뒤쪽 N개만 스캔하면 최근 데이터만 보는 게 된다.
+//
+// NN에 들어가는 raw_pred 계산(preproc.process()/nn.predict())은 이 함수를
+// 전혀 안 타고 여전히 snapshot 128개 전체를 그대로 쓴다 — 이 함수는 오직
+// REST 강제 판정(candidate_pred==REST 여부)에만 쓰이는, NN 파이프라인과
+// 완전히 분리된 별도 계산이다.
+//
+// 8채널을 평균내지 않고 chAmp[ch]에 채널별로 따로 담는 이유는 위
+// restFloorEstimate 선언부 주석 참고(평균내면 sup/pro 같은 소수 채널
+// 제스처가 희석됨). DEBUG_ADC_STATS 블록의 [ADC] 로그용 min/max 계산은
+// 이것과 별개로 전체 128개를 본다(디버그 표시 목적, rest 판정과 무관).
+void computeRestAmplitudes(int16_t win[WINDOW_SIZE][N_CHANNEL], float chAmp[N_CHANNEL]) {
+  int startIdx = WINDOW_SIZE - REST_AMP_WINDOW_SAMPLES;
   for (int ch = 0; ch < N_CHANNEL; ch++) {
     int mn = 999, mx = -999;
-    for (int n = 0; n < WINDOW_SIZE; n++) {
+    for (int n = startIdx; n < WINDOW_SIZE; n++) {
       int v = win[n][ch];
       if (v < mn) mn = v;
       if (v > mx) mx = v;
@@ -1941,7 +1964,7 @@ void runInference() {
   // 오래(FLOOR_STALE_TIMEOUT_MS) 갱신이 없으면 그 채널만 self-lock 방지용
   // 강제 갱신한다.
   float chAmp[N_CHANNEL];
-  computeChannelAmplitudes(snapshot, chAmp);
+  computeRestAmplitudes(snapshot, chAmp);
   uint32_t nowMs = millis();
 
   bool isQuiet = true;
